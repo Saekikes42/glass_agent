@@ -41,6 +41,33 @@ class User(TimestampMixin, Base):
     prefs: Mapped[dict[str, Any]] = mapped_column(default=dict)  # выбранная в боте компания, ожидаемый ввод и т.п.
 
 
+class UserPlatformIdentity(TimestampMixin, Base):
+    """Явная привязка аккаунта VK/MAX к существующему пользователю и его правам."""
+    __tablename__ = "user_platform_identities"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    platform: Mapped[str] = mapped_column(String(16))
+    external_id: Mapped[str] = mapped_column(String(100))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    prefs: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    __table_args__ = (UniqueConstraint("platform", "external_id"), UniqueConstraint("platform", "user_id"))
+
+
+class BotUpdate(TimestampMixin, Base):
+    """Надёжный входящий журнал событий бота: подтверждение после сохранения в БД."""
+    __tablename__ = "bot_updates"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    platform: Mapped[str] = mapped_column(String(16))
+    event_key: Mapped[str] = mapped_column(String(200))
+    payload: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    __table_args__ = (UniqueConstraint("platform", "event_key"),
+                     Index("ix_bot_updates_pending", "platform", "status", "available_at"))
+
+
 class Company(TimestampMixin, Base):
     __tablename__ = "companies"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)

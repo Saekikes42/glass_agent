@@ -35,10 +35,14 @@ class Settings(BaseSettings):
     vk_oauth_scope: str = "offline"  # минимально нужные права: только бессрочный доступ к открытым данным
     # ключ администратора сообщества для публикации и ответов (права wall,photos,offline); лучше — секрет компании vk_token
     vk_publish_token: SecretStr | None = None
+    vk_bot_token: SecretStr | None = None
+    vk_bot_group_id: int | None = None
 
     # MAX (dev.max.ru): токен бота — business.max.ru → Чат-боты → Настройки
     max_bot_token: SecretStr | None = None
     max_api_base: str = "https://platform-api2.max.ru"
+    max_webhook_secret: SecretStr | None = None
+    max_bot_port: int = 8011
 
     # Модель: chatgpt_plus (по умолчанию) | mock_dev (ТЕСТОВАЯ модель для разработки фронтенда, ответы помечены)
     ai_provider: str = "chatgpt_plus"

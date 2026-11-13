@@ -38,18 +38,22 @@ async def login() -> int:
         attempt = AuthAttempt(client_id=client_id, redirect_uri=server.redirect_uri)
         url = build_authorization_url(attempt, host_id=host_id, agent_name=s.chatgpt_agent_name,
                                       login_hint=prev.email if prev else None,
-                                      prompt="consent" if prev else None)
+                                      prompt="consent" if prev and REQUIRED_SCOPE not in prev.scopes else None)
         print("Откройте ссылку и войдите в ChatGPT (если браузер не открылся сам):\n")
         print(url, "\n")
         webbrowser.open(url)
         print(f"Жду ответ на {server.redirect_uri} (до 5 минут)…")
-        query = await server.wait(300)
+        try:
+            query = await server.wait(300)
+        except asyncio.TimeoutError:
+            print("Время ожидания входа истекло. Запустите вход заново.")
+            return 2
     try:
         cb = parse_callback(query, attempt)
+        creds = await finish_login(cb, attempt, host_id, tm)
     except OAuthError as e:
         print(f"Авторизация не выполнена: {e}")
         return 2
-    creds = await finish_login(cb, attempt, host_id, tm)
     print(f"\nВход выполнен: {creds.email or '(email не передан)'}")
     print(f"Разрешения: {' '.join(creds.scopes)}")
     if REQUIRED_SCOPE not in creds.scopes:
@@ -80,8 +84,11 @@ async def status() -> int:
 
 
 async def logout() -> int:
-    await get_chatgpt_connector().disconnect()
+    confirmed = await get_chatgpt_connector().disconnect()
     print("Аккаунт ChatGPT отключён, токены удалены.")
+    if not confirmed:
+        print("OpenAI не подтвердил отзыв сессии. Проверьте доступ приложения в настройках ChatGPT.")
+        return 1
     return 0
 
 

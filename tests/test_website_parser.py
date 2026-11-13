@@ -1,4 +1,6 @@
 """Тесты парсера сайтов. Сеть замокана (httpx.MockTransport) — это НЕ проверка реального сайта."""
+from datetime import datetime, timezone
+
 import httpx
 import pytest
 
@@ -82,6 +84,24 @@ def test_normalize_and_classify():
     assert classify_page("https://x.ru/products/okna/") == "product_category"
     assert classify_page("https://x.ru/products/okna/ultra/") == "product"
     assert classify_page("https://x.ru/news/item-1/") == "news"
+
+
+async def test_website_news_backfills_publication_date_without_changing_text(tmp_path):
+    url = "https://example.ru/news/item-1/"
+    html = page("Новости производства", LONG)
+    pages = {"/news/item-1/": (200, html)}
+    handler, _ = make_site(pages)
+    store = JsonlDocumentStore(tmp_path)
+    await parser(handler).sync(url, store)
+    key = f"website:example.ru:{url}"
+    assert store.get(key).published_at is None
+    original_hash = store.get(key).content_hash
+
+    pages["/news/item-1/"] = (200, html.replace("</head>", '<meta property="article:published_time" '
+                                             'content="2026-09-24T09:00:00+05:00"></head>'))
+    updated = await parser(handler).sync(url, store)
+    assert updated.updated == 1 and store.get(key).content_hash == original_hash
+    assert store.get(key).published_at == datetime(2026, 9, 24, 4, tzinfo=timezone.utc)
 
 
 async def test_crawl_dedup_lang_robots_and_resync(tmp_path):

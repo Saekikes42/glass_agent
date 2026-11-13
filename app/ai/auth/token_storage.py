@@ -1,7 +1,7 @@
 """Защищённое хранение OAuth-токенов ChatGPT.
 
-Токены шифруются (Fernet, AES-128-CBC + HMAC) и пишутся атомарно в файл с
-правами 0600. Ключ — GLASS_SECRET_KEY или автоматически созданный
+Токены шифруются (Fernet, AES-128-CBC + HMAC) и пишутся атомарно в файл
+с доступом для владельца. Ключ — GLASS_SECRET_KEY или автоматически созданный
 data/secrets/master.key. Токены не попадают во Frontend, логи и в открытом
 виде в БД.
 """
@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -18,20 +22,59 @@ from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel, Field, SecretStr
 
 
+@lru_cache(maxsize=1)
+def _windows_owner_sid() -> str:
+    system32 = Path(os.environ["SystemRoot"]) / "System32"
+    result = subprocess.check_output([str(system32 / "whoami.exe"), "/user", "/fo", "csv", "/nh"])
+    match = re.search(rb"S-1-(?:\d+-)+\d+", result)
+    if match is None:
+        raise RuntimeError("Не удалось определить владельца файлов учётных данных")
+    return match.group().decode("ascii")
+
+
+def _write_private(path: Path, data: bytes, *, replace: bool = True) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=".cred", suffix=".tmp")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            if os.name == "nt":
+                system32 = Path(os.environ["SystemRoot"]) / "System32"
+                subprocess.run([str(system32 / "icacls.exe"), str(tmp), "/inheritance:r",
+                                "/grant:r", f"*{_windows_owner_sid()}:(F)"],
+                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if replace:
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if os.name != "nt" or attempt == 4:
+                        raise
+                    time.sleep(0.02)
+        elif os.name == "nt":
+            os.rename(tmp, path)  # Windows не заменяет существующий путь при rename.
+        else:
+            # Опубликовать полностью записанный ключ, не затирая ключ другого процесса.
+            os.link(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def load_fernet(secret: SecretStr | str | None, key_path: Path) -> Fernet:
     if secret:
         raw = secret.get_secret_value() if isinstance(secret, SecretStr) else secret
         return Fernet(raw.encode())
     key_path = Path(key_path)
-    if key_path.exists():
-        return Fernet(key_path.read_bytes().strip())
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(key_path.parent, 0o700)
-    key = Fernet.generate_key()
-    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(key)
-    return Fernet(key)
+    if not key_path.exists():
+        try:
+            _write_private(key_path, Fernet.generate_key(), replace=False)
+        except FileExistsError:
+            pass
+    return Fernet(key_path.read_bytes().strip())
 
 
 class ChatGPTCredentials(BaseModel):
@@ -101,26 +144,17 @@ class EncryptedTokenStorage:
         return self.path.with_suffix(self.path.suffix + ".lock")
 
     def load(self) -> ChatGPTCredentials | None:
-        if not self.path.exists():
-            return None
         try:
             raw = self._fernet.decrypt(self.path.read_bytes())
+        except FileNotFoundError:
+            return None
         except InvalidToken as e:
             raise RuntimeError("Не удалось расшифровать токены ChatGPT: изменился ключ шифрования") from e
         return ChatGPTCredentials.model_validate(json.loads(raw))
 
     def save(self, creds: ChatGPTCredentials) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         data = self._fernet.encrypt(creds.model_dump_json().encode())
-        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".cred", suffix=".tmp")
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-            os.replace(tmp, self.path)
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
+        _write_private(self.path, data)
 
     def clear(self) -> None:
         self.path.unlink(missing_ok=True)

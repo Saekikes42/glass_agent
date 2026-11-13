@@ -18,7 +18,7 @@ from app.services.sources import normalize_source_ref
 FIX = Path(__file__).parent / "fixtures" / "telegram_web"
 PAGE1 = (FIX / "salstek_page1.html").read_text(encoding="utf-8")  # посты 1114…1143, before=1114
 PAGE2 = (FIX / "salstek_page2.html").read_text(encoding="utf-8")  # посты 1088…1113
-INVITE = (FIX / "private_invite.html").read_text(encoding="utf-8")  # t.me/+5LuOqWJkZDU0N2Ri/s/10
+INVITE = (FIX / "private_invite.html").read_text(encoding="utf-8")  # t.me/+TestOnlyInvite01/s/10
 P1_IDS = sorted(p["id"] for p in parse_web_preview(PAGE1).posts)
 P2_IDS = sorted(p["id"] for p in parse_web_preview(PAGE2).posts)
 
@@ -94,6 +94,25 @@ async def test_new_posts_across_pages_saved_oldest_first(tmp_path):
     assert store.get_state("telegram_web:salstek")["last_message_id"] == max(P1_IDS)
 
 
+async def test_limited_incremental_sync_resumes_before_advancing_checkpoint(tmp_path):
+    store = JsonlDocumentStore(tmp_path)
+    store.set_state("telegram_web:salstek", {"last_message_id": min(P2_IDS)})
+    calls = []
+    p = parser(site({None: PAGE1, "1114": PAGE2}, calls))
+
+    first = await p.sync("salstek", store, max_posts=1)
+    state = store.get_state("telegram_web:salstek")
+    assert first.new == len(P1_IDS)
+    assert state["last_message_id"] == min(P2_IDS)
+    assert state["pending_before"] == min(P1_IDS)
+
+    store = JsonlDocumentStore(tmp_path)
+    second = await p.sync("salstek", store, max_posts=1)
+    assert calls == ["https://t.me/s/salstek", "https://t.me/s/salstek?before=1114"]
+    assert second.new == len(P2_IDS) - 1
+    assert store.get_state("telegram_web:salstek")["last_message_id"] == max(P1_IDS)
+
+
 async def test_network_error_keeps_position_and_logs(tmp_path, caplog):
     await parser(site({None: PAGE2})).sync("salstek", JsonlDocumentStore(tmp_path))
     caplog.set_level(logging.ERROR, logger="glass.telegram_web")
@@ -131,7 +150,7 @@ async def test_private_invite_page_is_explained(tmp_path):
     with pytest.raises(TelegramAccessError, match="закрытый канал"):
         parse_web_preview(INVITE)
     with pytest.raises(TelegramAccessError):
-        await parser(site({None: INVITE})).sync("https://t.me/+5LuOqWJkZDU0N2Ri/s/10", JsonlDocumentStore(tmp_path))
+        await parser(site({None: INVITE})).sync("https://t.me/+TestOnlyInvite01/s/10", JsonlDocumentStore(tmp_path))
 
 
 def test_one_channel_one_source():

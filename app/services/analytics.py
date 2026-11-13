@@ -10,11 +10,22 @@ import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Document, Post, Source
+
+METRIC_LABELS = {
+    "views": "просм.",
+    "likes": "отм. «Нравится»",
+    "reactions_total": "реакц.",
+    "comments": "коммент.",
+    "replies": "ответов",
+    "reposts": "репостов",
+    "forwards": "пересылок",
+}
 
 
 def _num(v: Any) -> float | None:
@@ -76,11 +87,10 @@ def format_effectiveness(docs: list[Document]) -> dict[str, Any]:
     """Средние просмотры/вовлечённость по формату: тип медиа, длина текста, час публикации, день недели."""
     groups: dict[str, dict[str, list[float]]] = {"media": {}, "length": {}, "hour_utc": {}, "weekday": {}}
     wd = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+    metric = "views" if any(_num((d.metrics or {}).get("views")) is not None for d in docs) else "engagement"
     for d in docs:
         m = d.metrics or {}
-        v = _num(m.get("views"))
-        e = _engagement(m)
-        score = v if v is not None else e
+        score = _num(m.get("views")) if metric == "views" else _engagement(m)
         if score is None:
             continue
         media = "+".join(sorted(set((d.meta or {}).get("media_types") or []))) or "текст"
@@ -91,7 +101,6 @@ def format_effectiveness(docs: list[Document]) -> dict[str, Any]:
             keys["weekday"] = wd[dt.weekday()]
         for g, k in keys.items():
             groups[g].setdefault(k, []).append(score)
-    metric = "views" if any(_num((d.metrics or {}).get("views")) is not None for d in docs) else "engagement"
     out: dict[str, Any] = {"metric": metric}
     for g, vals in groups.items():
         rows = [{"value": k, "posts": len(v), "avg": round(statistics.mean(v), 1)} for k, v in vals.items() if len(v) >= 2]
@@ -146,27 +155,58 @@ async def analyze_channel(session: AsyncSession, company_id: uuid.UUID, platform
 
 
 async def post_analytics(session: AsyncSession, post: Post) -> dict[str, Any]:
-    """Показатели опубликованного поста — из собранного парсером поста канала с тем же message_id."""
+    """Ищет пост среди собственных источников компании по площадке, каналу и ID."""
     base = {"post_id": str(post.id), "status": post.status, "external_message_id": post.external_message_id,
             "external_url": post.external_url}
     if post.status != "published" or not post.external_message_id:
         return {**base, "metrics": None, "note": "Пост ещё не опубликован — статистики нет"}
-    docs = (await session.scalars(select(Document).where(
-        Document.company_id == post.company_id, Document.source_type == "telegram"))).all()
-    mid = int(post.external_message_id)
-    match = next((d for d in docs if mid in ((d.meta or {}).get("message_ids") or [])
-                  and (not post.target_chat_id or _same_chat(post.target_chat_id, d))), None)
+    platform = post.platform
+    if platform not in {"telegram", "vk"}:
+        return {**base, "metrics": None, "note": f"Сбор статистики постов {platform} не подключён"}
+    mid = post.external_message_id
+    if not mid.isdecimal():
+        return {**base, "metrics": None, "note": "Внешний ID публикации не соответствует формату площадки"}
+    docs = (await session.scalars(select(Document).join(Source).where(
+        Document.company_id == post.company_id, Source.company_id == post.company_id,
+        Document.source_type == platform, Document.is_competitor.is_(False),
+        Source.is_competitor.is_(False),
+    ).order_by(Document.fetched_at.desc().nulls_last()))).all()
+    match = next((d for d in docs if _matches_post(post, d) and any(
+        _num((d.metrics or {}).get(key)) is not None for key in METRIC_LABELS)), None)
     if match is None:
         return {**base, "metrics": None,
-                "note": "Показатели ещё не собраны: синхронизируйте источник канала (telegram_web/telegram)"}
+                "note": f"Показатели ещё не собраны: синхронизируйте свой источник {platform}"}
     return {**base, "metrics": match.metrics, "collected_at": match.fetched_at.isoformat() if match.fetched_at else None}
 
 
-def _same_chat(target: str, d: Document) -> bool:
-    meta = d.meta or {}
-    t = target.lstrip("@").lower()
-    return t in {str(meta.get("channel_username") or "").lower(), str(meta.get("channel_id") or ""),
-                 d.external_key.split(":")[1].lower()}
+def _telegram_channel(value: str) -> str:
+    ref = value.strip().lower().lstrip("@")
+    return ref[4:] if ref.startswith("-100") and ref[4:].isdigit() else ref
+
+
+def _matches_post(post: Post, doc: Document) -> bool:
+    parts = doc.external_key.split(":", 2)
+    if len(parts) != 3:
+        return False
+    _, source_key, document_key = parts
+    meta = doc.meta or {}
+    target = post.target_chat_id or ""
+    url_path = urlsplit(post.external_url or "").path.strip("/")
+    if post.platform == "telegram":
+        if post.external_message_id not in {document_key, *(str(mid) for mid in meta.get("message_ids") or [])}:
+            return False
+        channel, _, _ = url_path.rpartition("/")
+        channel = channel.removeprefix("c/")
+        expected = {_telegram_channel(value) for value in (target, channel) if value}
+        found = {_telegram_channel(str(value)) for value in
+                 (source_key, meta.get("channel_username"), meta.get("channel_id")) if value}
+        return bool(expected & found)
+    wall, _, url_mid = url_path.removeprefix("wall").partition("_")
+    expected = {target.lstrip("-").lower()} if target else set()
+    if url_path.startswith("wall") and wall.lstrip("-").isdigit() and url_mid == post.external_message_id:
+        expected.add(wall.lstrip("-"))
+    found = {source_key.lower(), str(meta.get("group_screen_name") or "").lower()} - {""}
+    return document_key == post.external_message_id and bool(expected & found)
 
 
 async def company_analytics(session: AsyncSession, company_id: uuid.UUID) -> dict[str, Any]:
@@ -241,9 +281,11 @@ def report_text(company_name: str, rep: dict[str, Any], conclusions: str | None 
     if rep["published_by_system"]:
         lines.append("\nОпубликовано системой:")
         for p in rep["published_by_system"]:
-            m = p["metrics"] or {}
-            lines.append(f"  • {p['topic'] or p['id']} ({p['platform']}) — "
-                         + (f"{m.get('views')} просм." if m.get("views") is not None else "показатели ещё не собраны"))
+            metrics = p["metrics"] or {}
+            values = [f"{value:g} {label}" for key, label in METRIC_LABELS.items()
+                      if (value := _num(metrics.get(key))) is not None]
+            details = ", ".join(values) or "показатели ещё не собраны"
+            lines.append(f"  • {p['topic'] or p['id']} ({p['platform']}) — {details}")
     if not rep["channels"] and not rep["published_by_system"]:
         lines.append("Нет собранных данных: подключите и синхронизируйте каналы.")
     if conclusions:

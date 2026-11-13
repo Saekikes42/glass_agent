@@ -35,9 +35,13 @@ class ImageError(RuntimeError):
 
 def find_font(bold: bool = False) -> str:
     env = os.environ.get("GLASS_FONT_BOLD" if bold else "GLASS_FONT")
-    for p in ([env] if env else []) + FONT_CANDIDATES[bold] + FONT_CANDIDATES[not bold]:
-        if p and Path(p).is_file():
-            return p
+    windows_fonts = Path(os.environ["SystemRoot"]) / "Fonts" if os.name == "nt" else None
+    names = ("arialbd.ttf", "segoeuib.ttf", "arial.ttf", "segoeui.ttf") if bold else (
+        "arial.ttf", "segoeui.ttf")
+    candidates = [windows_fonts / name for name in names] if windows_fonts else []
+    for path in ([env] if env else []) + candidates + FONT_CANDIDATES[bold] + FONT_CANDIDATES[not bold]:
+        if Path(path).is_file():
+            return str(path)
     raise ImageError("Не найден шрифт с кириллицей: установите DejaVu (fonts-dejavu) или задайте GLASS_FONT")
 
 

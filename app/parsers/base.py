@@ -111,6 +111,12 @@ class ParsedDocument(BaseModel):
         if not self.content_hash:
             self.content_hash = content_hash(self.title, self.text)
 
+    def differs_from(self, old: ParsedDocument) -> bool:
+        """Сравнение содержимого и полей, которые должны обновляться независимо от текста."""
+        return (self.content_hash, self.url, self.published_at, self.edited_at, self.metadata) != (
+            old.content_hash, old.url, old.published_at, old.edited_at, old.metadata,
+        )
+
 
 class SyncResult(BaseModel):
     source_type: SourceType
@@ -207,7 +213,7 @@ class JsonlDocumentStore:
         if old is None:
             self._docs[doc.key] = doc
             return UpsertStatus.NEW
-        if old.content_hash != doc.content_hash:
+        if doc.differs_from(old):
             self._docs[doc.key] = doc
             return UpsertStatus.UPDATED
         if old.metrics != doc.metrics:

@@ -242,10 +242,10 @@ class TelegramWebPreviewParser:
         return r
 
     async def _collect(self, client: httpx.AsyncClient, username: str, last_id: int, first_run: bool,
-                       initial_pages: int, max_posts: int, warnings: list[str]) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
+                       initial_pages: int, max_posts: int, warnings: list[str],
+                       before: int | None = None) -> tuple[dict[str, Any], dict[int, dict[str, Any]], int | None]:
         info: dict[str, Any] = {}
         collected: dict[int, dict[str, Any]] = {}
-        before: int | None = None
         pages = 0
         while True:
             url = self.BASE + username + (f"?before={before}" if before else "")
@@ -269,16 +269,13 @@ class TelegramWebPreviewParser:
                     break
             elif min_id <= last_id:
                 break  # дошли до уже сохранённых постов
-            if len(collected) >= max_posts:
-                if not first_run and min_id > last_id + 1:
-                    warnings.append(f"достигнут лимит max_posts={max_posts}: посты с id {last_id + 1}…{min_id - 1} "
-                                    "не собраны за этот проход")
-                break
             if not page.before or page.before <= 1 or page.before == before:
                 break
+            if len(collected) >= max_posts:
+                return info, collected, page.before if not first_run else None
             before = page.before
             await asyncio.sleep(self.delay)
-        return info, collected
+        return info, collected, None
 
     async def sync(self, ref: str, store: JsonlDocumentStore, *, max_posts: int = 1000,
                    initial_pages: int = 1, index_callback: IndexCallback | None = None) -> SyncResult:
@@ -291,6 +288,7 @@ class TelegramWebPreviewParser:
         state_key = f"telegram_web:{channel}"
         state = store.get_state(state_key)
         last_id = int(state.get("last_message_id", 0))
+        pending_high = int(state.get("pending_high", last_id))
         first_run = last_id == 0
         result = SyncResult(source_type=SourceType.TELEGRAM, source_id=channel)
         changed: list[ParsedDocument] = []
@@ -298,8 +296,10 @@ class TelegramWebPreviewParser:
         try:
             async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False, transport=self._transport,
                                          headers={"User-Agent": DEFAULT_USER_AGENT}) as client:
-                info, collected = await self._collect(client, username, last_id, first_run, initial_pages,
-                                                      max_posts, warnings)
+                info, collected, next_before = await self._collect(
+                    client, username, last_id, first_run, initial_pages, max_posts, warnings,
+                    before=state.get("pending_before"),
+                )
         except TelegramAccessError:
             raise  # ошибка настройки (закрытый канал) — повтор не поможет
         except (httpx.HTTPError, TelegramWebStructureError) as e:
@@ -322,10 +322,12 @@ class TelegramWebPreviewParser:
             doc = web_post_to_document(collected[pid], title)
             if store.get(doc.key) is not None:  # более старые, никогда не сохранявшиеся посты не догружаем
                 await _store_docs([doc], store, result, changed)
-        max_id = max([last_id] + [p["id"] for p in new_posts])
+        high_id = max([last_id, pending_high] + [p["id"] for p in new_posts])
+        max_id = last_id if next_before is not None else high_id
         store.set_state(state_key, {
             "ref": ref, "channel": channel, "last_message_id": max_id, "last_sync": utcnow().isoformat(),
             "last_error": None, "title": title, **{k: v for k, v in info.items() if k != "title"},
+            **({"pending_before": next_before, "pending_high": high_id} if next_before is not None else {}),
         })
         store.save()
         result.notes.append(
@@ -334,6 +336,8 @@ class TelegramWebPreviewParser:
             + f", последний сохранённый id {max_id}")
         if warnings:
             result.notes.append(f"предупреждений разметки: {len(warnings)} (см. лог)")
+        if next_before is not None:
+            result.notes.append(f"достигнут лимит max_posts={max_posts}, загрузка продолжится с before={next_before}")
         log.info("@%s: новых %d, обновлено %d, последний id %s", channel, result.new, result.updated, max_id)
         if index_callback and changed:
             await index_callback(changed)

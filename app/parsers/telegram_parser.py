@@ -110,6 +110,10 @@ def _as_utc(dt: datetime | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def _max_available(values: Iterable[int | None]) -> int | None:
+    return max((value for value in values if value is not None), default=None)
+
+
 def messages_to_documents(messages: Iterable[Any], *, channel_id: int, channel_title: str,
                           username: str | None) -> list[ParsedDocument]:
     """Преобразует сообщения Telethon в документы. Альбомы (grouped_id) склеиваются в один пост."""
@@ -138,14 +142,14 @@ def messages_to_documents(messages: Iterable[Any], *, channel_id: int, channel_t
         for p in parts:
             for k, v in _reactions(p).items():
                 reactions[k] = max(reactions.get(k, 0), v)
-        replies = max((getattr(getattr(p, "replies", None), "replies", 0) or 0) for p in parts)
         fwd = getattr(first, "fwd_from", None)
         metrics = {
-            "views": max((getattr(p, "views", None) or 0) for p in parts),
-            "forwards": max((getattr(p, "forwards", None) or 0) for p in parts),
-            "replies": replies,
+            "views": _max_available(getattr(p, "views", None) for p in parts),
+            "forwards": _max_available(getattr(p, "forwards", None) for p in parts),
+            "replies": _max_available(getattr(getattr(p, "replies", None), "replies", None) for p in parts),
             "reactions": reactions,
-            "reactions_total": sum(reactions.values()),
+            "reactions_total": (sum(reactions.values())
+                                if any(getattr(p, "reactions", None) is not None for p in parts) else None),
         }
         docs.append(ParsedDocument(
             source_type=SourceType.TELEGRAM,
@@ -287,7 +291,7 @@ class TelethonChannelParser:
 BOT_MEDIA_KEYS = ("photo", "video", "animation", "document", "audio", "voice", "video_note", "sticker", "poll")
 
 
-def bot_post_to_document(post: dict[str, Any]) -> ParsedDocument | None:
+def bot_post_to_document(post: dict[str, Any], store: JsonlDocumentStore | None = None) -> ParsedDocument | None:
     chat = post.get("chat", {})
     text = clean_text(post.get("text") or post.get("caption") or "")
     media = [k for k in BOT_MEDIA_KEYS if k in post]
@@ -301,7 +305,7 @@ def bot_post_to_document(post: dict[str, Any]) -> ParsedDocument | None:
     raw = post.get("text") or post.get("caption") or ""
     tags = [raw[e["offset"]:e["offset"] + e["length"]].lstrip("#").lower() for e in entities if e.get("type") == "hashtag"]
     key = f"album{post['media_group_id']}" if post.get("media_group_id") else str(mid)
-    return ParsedDocument(
+    doc = ParsedDocument(
         source_type=SourceType.TELEGRAM,
         source_id=short_id,
         external_id=key,
@@ -322,6 +326,27 @@ def bot_post_to_document(post: dict[str, Any]) -> ParsedDocument | None:
             "via": "bot_api",
         },
     )
+    if not post.get("media_group_id"):
+        return doc
+    old = store.get(doc.key) if store is not None else None
+    parts = dict(old.metadata.get("album_parts", {})) if old is not None else {}
+    if old is not None and not parts:
+        first = old.metadata["message_ids"][0]
+        parts[str(first)] = {"text": old.text, "media": old.metadata["media_types"]}
+    parts[str(mid)] = {"text": doc.text, "media": media}
+    ids = sorted(int(pid) for pid in parts)
+    doc.text = clean_text("\n\n".join(parts[str(pid)]["text"] for pid in ids))
+    all_media = [kind for pid in ids for kind in parts[str(pid)]["media"]]
+    doc.title = make_title(doc.text, all_media)
+    doc.metadata.update(album_parts=parts, message_ids=ids, media_types=all_media,
+                        media_count=len(all_media), hashtags=extract_hashtags(doc.text))
+    if old is not None:
+        doc.published_at = min(old.published_at or doc.published_at, doc.published_at)
+        doc.edited_at = max(filter(None, (old.edited_at, doc.edited_at)), default=None)
+    doc.url = doc.url.rsplit("/", 1)[0] + f"/{ids[0]}"
+    doc.content_hash = ""
+    doc.model_post_init(None)
+    return doc
 
 
 class TelegramBotChannelReader:
@@ -341,9 +366,11 @@ class TelegramBotChannelReader:
         self._token = token.get_secret_value() if isinstance(token, SecretStr) else token
         self._transport = transport
 
-    async def sync(self, store: JsonlDocumentStore, index_callback: IndexCallback | None = None) -> SyncResult:
+    async def sync(self, store: JsonlDocumentStore, index_callback: IndexCallback | None = None,
+                   *, channel_id: int | None = None) -> SyncResult:
         result = SyncResult(source_type=SourceType.TELEGRAM, source_id="bot_api")
-        state = store.get_state("telegram_bot")
+        state_key = f"telegram_bot:{channel_id}" if channel_id is not None else "telegram_bot"
+        state = store.get_state(state_key)
         offset = int(state.get("offset", 0))
         changed: list[ParsedDocument] = []
         async with httpx.AsyncClient(timeout=30, transport=self._transport) as client:
@@ -359,26 +386,20 @@ class TelegramBotChannelReader:
                 for upd in updates:
                     offset = max(offset, upd["update_id"] + 1)
                     post = upd.get("channel_post") or upd.get("edited_channel_post")
-                    doc = bot_post_to_document(post) if post else None
+                    if post and channel_id is not None and post.get("chat", {}).get("id") != channel_id:
+                        result.skipped += 1
+                        continue
+                    doc = bot_post_to_document(post, store) if post else None
                     if doc is None:
                         result.skipped += 1
                         continue
-                    old = store.get(doc.key)
-                    if old is not None and doc.external_id.startswith("album"):
-                        # часть альбома: дополняем уже сохранённый пост
-                        doc.text = clean_text("\n\n".join(x for x in (old.text, doc.text) if x))
-                        doc.metadata["message_ids"] = sorted(set(old.metadata["message_ids"]) | set(doc.metadata["message_ids"]))
-                        doc.metadata["media_types"] = old.metadata["media_types"] + doc.metadata["media_types"]
-                        doc.metadata["media_count"] = len(doc.metadata["media_types"])
-                        doc.content_hash = ""
-                        doc.model_post_init(None)
                     status = store.upsert(doc)
                     result.count(status)
                     if status in (UpsertStatus.NEW, UpsertStatus.UPDATED):
                         changed.append(doc)
                 if len(updates) < 100:
                     break
-        store.set_state("telegram_bot", {"offset": offset, "last_sync": utcnow().isoformat()})
+        store.set_state(state_key, {"offset": offset, "last_sync": utcnow().isoformat()})
         store.save()
         if index_callback and changed:
             await index_callback(changed)

@@ -32,14 +32,25 @@ class HashEmbedder:
 
 
 @pytest.fixture(autouse=True)
-def no_real_credentials(monkeypatch):
+def no_real_credentials(monkeypatch, tmp_path):
     """Тесты никогда не используют настоящие токены из .env (никаких запросов к реальным Telegram/VK/MAX/ChatGPT)."""
     from app.core.config import get_settings
+    from app.ai.factory import get_chatgpt_connector, get_token_manager
 
     s = get_settings()
-    for name in ("tg_bot_token", "vk_access_token", "vk_publish_token", "max_bot_token", "tg_api_hash"):
+    for name in ("tg_bot_token", "vk_access_token", "vk_publish_token", "vk_bot_token", "max_bot_token",
+                 "max_webhook_secret", "tg_api_hash"):
         monkeypatch.setattr(s, name, None)
     monkeypatch.setattr(s, "ai_provider", "chatgpt_plus")
+    monkeypatch.setattr(s, "glass_secret_key", None)
+    monkeypatch.setattr(s, "master_key_path", tmp_path / "test-master.key")
+    monkeypatch.setattr(s, "chatgpt_credentials_path", tmp_path / "test-credentials.enc")
+    monkeypatch.setattr(s, "chatgpt_host_id_path", tmp_path / "test-host-id")
+    get_chatgpt_connector.cache_clear()
+    get_token_manager.cache_clear()
+    yield
+    get_chatgpt_connector.cache_clear()
+    get_token_manager.cache_clear()
 
 
 @pytest_asyncio.fixture

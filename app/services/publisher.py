@@ -31,10 +31,17 @@ TEXT_LIMIT = 4096
 
 
 class PublishError(RuntimeError):
-    def __init__(self, message: str, *, retry_after: float | None = None, permanent: bool = False):
+    def __init__(self, message: str, *, retry_after: float | None = None, permanent: bool = False,
+                 uncertain: bool = False):
         super().__init__(message)
         self.retry_after = retry_after
         self.permanent = permanent
+        self.uncertain = uncertain
+        self.photo_id: str | None = None
+
+
+def request_may_have_arrived(error: httpx.TransportError) -> bool:
+    return not isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
 
 
 class TelegramBotAPI:
@@ -49,22 +56,30 @@ class TelegramBotAPI:
 
     async def call(self, method: str, data: dict[str, Any] | None = None,
                    files: dict[str, Any] | None = None, timeout: float = 30) -> Any:
+        sending = method in {"sendMessage", "sendPhoto"}
         async with httpx.AsyncClient(timeout=timeout, transport=self._transport) as c:
             try:
                 r = await c.post(f"{self.api_base}/bot{self._token}/{method}", data=data if files else None,
                                  json=None if files else data, files=files)
             except httpx.TransportError as e:
-                raise PublishError(f"Сеть: {type(e).__name__}") from e  # токен в сообщение не попадает
+                raise PublishError(f"Сеть: {type(e).__name__}",
+                                   uncertain=sending and request_may_have_arrived(e)) from e
         try:
             body = r.json()
         except ValueError:
-            raise PublishError(f"Telegram: HTTP {r.status_code}")
-        if not body.get("ok"):
+            body = None
+        if not isinstance(body, dict):
+            raise PublishError(f"Telegram: HTTP {r.status_code}", uncertain=sending)
+        if body.get("ok") is not True:
             params = body.get("parameters") or {}
             code = body.get("error_code") or r.status_code
             raise PublishError(f"Telegram {code}: {body.get('description')}", retry_after=params.get("retry_after"),
-                               permanent=code in (400, 401, 403, 404))
-        return body["result"]
+                               permanent=code in (400, 401, 403, 404),
+                               uncertain=sending and (code >= 500 or body.get("ok") is not False))
+        result = body.get("result")
+        if sending and (not isinstance(result, dict) or not result.get("message_id")):
+            raise PublishError("Telegram: в ответе нет message_id", uncertain=True)
+        return result
 
 
 class Publisher(Protocol):
@@ -77,18 +92,29 @@ class TelegramPublisher:
 
     async def publish(self, post: Post, chat_id: str) -> dict[str, Any]:
         text = post.text.strip()
-        if post.image_path and Path(post.image_path).is_file():
-            if len(text) <= CAPTION_LIMIT:
+        if len(text) > TEXT_LIMIT:
+            raise PublishError(f"Текст длиннее {TEXT_LIMIT} символов", permanent=True)
+        photo_id = (post.meta or {}).get("telegram_photo_id")
+        if post.image_path and photo_id is None:
+            if not Path(post.image_path).is_file():
+                raise PublishError("Файл изображения не найден", permanent=True)
+            if _telegram_length(text) <= CAPTION_LIMIT:
                 with open(post.image_path, "rb") as f:
                     res = await self.api.call("sendPhoto", {"chat_id": chat_id, "caption": text},
                                               files={"photo": (Path(post.image_path).name, f.read(), "image/png")})
                 return _result(res)
-            with open(post.image_path, "rb") as f:  # длинный текст: фото, затем текст отдельным сообщением
-                await self.api.call("sendPhoto", {"chat_id": chat_id},
-                                    files={"photo": (Path(post.image_path).name, f.read(), "image/png")})
-        if len(text) > TEXT_LIMIT:
-            raise PublishError(f"Текст длиннее {TEXT_LIMIT} символов", permanent=True)
-        return _result(await self.api.call("sendMessage", {"chat_id": chat_id, "text": text}))
+            with open(post.image_path, "rb") as f:
+                photo = await self.api.call("sendPhoto", {"chat_id": chat_id},
+                                            files={"photo": (Path(post.image_path).name, f.read(), "image/png")})
+            photo_id = str(photo["message_id"])
+        try:
+            res = _result(await self.api.call("sendMessage", {"chat_id": chat_id, "text": text}))
+        except PublishError as error:
+            error.photo_id = photo_id
+            raise
+        if photo_id is not None:
+            res["photo_id"] = photo_id
+        return res
 
 
 def _result(res: dict[str, Any]) -> dict[str, Any]:
@@ -124,17 +150,10 @@ class TelegramNotifier:
                                      .where(CompanyMember.company_id == post.company_id,
                                             CompanyMember.role.in_(["owner", "approver"]),
                                             User.telegram_id.is_not(None)))).all()
-        text, kb = approval_message(post)
+        company = await session.get(Company, post.company_id)
         for tid in ids:
             try:
-                if post.image_path and Path(post.image_path).is_file() and len(text) <= CAPTION_LIMIT:
-                    with open(post.image_path, "rb") as f:
-                        import json as _json
-                        await self.api.call("sendPhoto", {"chat_id": tid, "caption": text,
-                                                          "reply_markup": _json.dumps(kb)},
-                                            files={"photo": (Path(post.image_path).name, f.read(), "image/png")})
-                else:
-                    await self.api.call("sendMessage", {"chat_id": tid, "text": text, "reply_markup": kb})
+                await send_approval_preview(self.api, tid, post, company)
             except PublishError as e:
                 log.warning("Уведомление %s не доставлено: %s", tid, e)
 
@@ -146,21 +165,49 @@ class TelegramNotifier:
                 log.warning("Уведомление администратору %s не доставлено: %s", tid, e)
 
 
-def approval_message(post: Post) -> tuple[str, dict[str, Any]]:
+def approval_message(post: Post, company: Company) -> tuple[str, dict[str, Any]]:
     """Сообщение на согласование: материал, площадка, предполагаемое время (п. 3.5 ТЗ) и кнопки."""
     platform = {"telegram": "Telegram", "vk": "ВКонтакте", "max": "MAX"}.get(post.platform, post.platform)
     when = post.proposed_at.astimezone().strftime("%d.%m.%Y %H:%M") if post.proposed_at else "сразу после согласования"
     checks = (post.meta or {}).get("checks") or {}
     warn = "".join(f"\n⚠️ {w}" for w in checks.get("warnings", [])[:3])
-    text = (f"📝 На согласование · {platform} · {when}\nТема: {post.topic or '—'} · ревизия {post.revision}"
+    target = P.target_for(post, company) or "не указан"
+    text = (f"📝 На согласование · {platform} · {when}\nКанал: {target}\n"
+            f"Тема: {post.topic or '—'} · ревизия {post.revision}"
             f"{' · с изображением' if post.image_path else ''}{warn}\n\n{post.text}")
-    if len(text) > 3900:
-        text = text[:3900] + "…"
-    kb = {"inline_keyboard": [[{"text": "✅ Согласовать", "callback_data": f"ap:{post.id}"},
-                               {"text": "🚀 Согласовать и опубликовать", "callback_data": f"pn:{post.id}"}],
-                              [{"text": "✏️ На доработку", "callback_data": f"rv:{post.id}"},
-                               {"text": "❌ Отклонить", "callback_data": f"rj:{post.id}"}]]}
+    ref = f"{post.id}:{P.review_token(post, company)}"
+    kb = {"inline_keyboard": [[{"text": "✅ Согласовать", "callback_data": f"ap:{ref}"},
+                               {"text": "🚀 Согласовать и опубликовать", "callback_data": f"pn:{ref}"}],
+                              [{"text": "✏️ На доработку", "callback_data": f"rv:{ref}"},
+                               {"text": "❌ Отклонить", "callback_data": f"rj:{ref}"}]]}
     return text, kb
+
+
+def _telegram_length(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+async def send_approval_preview(api: TelegramBotAPI, chat_id: int, post: Post, company: Company) -> None:
+    import json
+
+    text, keyboard = approval_message(post, company)
+    if post.image_path:
+        path = Path(post.image_path)
+        if not path.is_file():
+            raise PublishError("Файл изображения для согласования не найден", permanent=True)
+        with path.open("rb") as f:
+            files = {"photo": (path.name, f.read(), "image/png")}
+        if _telegram_length(text) <= CAPTION_LIMIT:
+            await api.call("sendPhoto", {"chat_id": chat_id, "caption": text,
+                                        "reply_markup": json.dumps(keyboard)}, files=files)
+            return
+        await api.call("sendPhoto", {"chat_id": chat_id}, files=files)
+
+    while _telegram_length(text) > TEXT_LIMIT:
+        # 2048 Unicode code points always fit into the 4096 UTF-16-unit limit.
+        await api.call("sendMessage", {"chat_id": chat_id, "text": text[:2048]})
+        text = text[2048:]
+    await api.call("sendMessage", {"chat_id": chat_id, "text": text, "reply_markup": keyboard})
 
 
 class LogNotifier:
@@ -178,7 +225,8 @@ class LogNotifier:
         log.warning("[admin] %s", text)
 
     async def notify_approval(self, session, post):
-        text, _ = approval_message(post)
+        company = await session.get(Company, post.company_id)
+        text, _ = approval_message(post, company)
         self.approvals.append(text)
         log.info("[approval] %s", text[:200])
 
@@ -191,13 +239,15 @@ def as_hub(publisher: Any):
 
 
 async def publish_one(sm: async_sessionmaker[AsyncSession], post_id: uuid.UUID, publisher: Any,
-                      notifier: Notifier, *, max_attempts: int = 3) -> str:
+                      notifier: Notifier, *, max_attempts: int = 3, due_by: datetime | None = None) -> str:
     """Публикует один запланированный пост. Возвращает итоговый статус."""
     async with sm() as s, s.begin():
-        if not await P.claim_for_publishing(s, post_id):
+        if not await P.claim_for_publishing(s, post_id, due_by=due_by):
             return "skipped"  # уже публикуется/опубликован другим воркером или снят с расписания
     async with sm() as s:
-        post = await s.get(Post, post_id)
+        post = await s.get(Post, post_id, with_for_update=True)
+        if post is None or post.status != P.PUBLISHING:
+            return "skipped"
         company = await s.get(Company, post.company_id)
         hub = as_hub(publisher)
         error: PublishError | None = None
@@ -207,6 +257,8 @@ async def publish_one(sm: async_sessionmaker[AsyncSession], post_id: uuid.UUID, 
             error = PublishError("Контент изменён после согласования — нужна повторная проверка", permanent=True)
         else:
             try:
+                if (post.meta or {}).get("publish_uncertain"):
+                    raise PublishError("Результат предыдущей отправки неизвестен", uncertain=True)
                 pub, chat_id = await hub.resolve(s, post, company)
                 res = await pub.publish(post, chat_id)
             except PublishError as e:
@@ -218,6 +270,8 @@ async def publish_one(sm: async_sessionmaker[AsyncSession], post_id: uuid.UUID, 
             # VK: сохраняем числовой owner_id стены (нужен для сбора комментариев), иначе — указанный канал
             post.target_chat_id = res.get("chat_id") if post.platform == "vk" and res.get("chat_id") else chat_id
             post.last_error = None
+            if res.get("photo_id"):
+                post.meta = {**(post.meta or {}), "telegram_photo_id": res["photo_id"]}
             s.add(AuditLog(company_id=post.company_id, action="post.publish",
                            details={"post_id": str(post.id), "message_id": res["message_id"], "chat": chat_id}))
             await mem.remember(s, post.company_id, f"Пост {post.id} опубликован в {chat_id}"
@@ -227,9 +281,18 @@ async def publish_one(sm: async_sessionmaker[AsyncSession], post_id: uuid.UUID, 
                    + (f": {res['url']}" if res.get("url") else ""))
         else:
             post.last_error = str(error)
+            if error.photo_id:
+                post.meta = {**(post.meta or {}), "telegram_photo_id": error.photo_id}
             if not P.is_approved_content(post):
-                post.status = P.DRAFT
-                post.approved_hash = None
+                if (post.meta or {}).get("telegram_photo_id"):
+                    post.status = P.FAILED
+                else:
+                    post.status = P.DRAFT
+                    post.approved_hash = None
+            elif error.uncertain:
+                post.status = P.FAILED
+                post.meta = {**(post.meta or {}), "publish_uncertain": True}
+                post.last_error = f"{error}. Результат отправки неизвестен, проверьте канал"
             elif error.permanent or post.publish_attempts >= max_attempts:
                 post.status = P.FAILED
             else:
@@ -237,11 +300,16 @@ async def publish_one(sm: async_sessionmaker[AsyncSession], post_id: uuid.UUID, 
                 delay = error.retry_after or 60 * 2 ** (post.publish_attempts - 1)
                 post.scheduled_at = now + timedelta(seconds=delay)
             s.add(AuditLog(company_id=post.company_id, action="post.publish_error",
-                           details={"post_id": str(post.id), "error": str(error), "status": post.status}))
+                            details={"post_id": str(post.id), "error": post.last_error, "status": post.status}))
             if post.status == P.FAILED:
                 await mem.remember(s, post.company_id, f"Публикация поста {post.id} не удалась: {error}",
                                    kind="episodic", category="post_failed", meta={"post_id": str(post.id)})
-            msg = (f"⚠️ Пост «{post.topic or post.text[:50]}» не опубликован: {error}. Статус: {post.status}")
+            if error.uncertain:
+                msg = f"⚠️ Пост «{post.topic or post.text[:50]}». {post.last_error}."
+            elif (post.meta or {}).get("telegram_photo_id"):
+                msg = f"⚠️ Фото уже отправлено, текст не доставлен: {error}. Статус: {post.status}"
+            else:
+                msg = f"⚠️ Пост «{post.topic or post.text[:50]}» не опубликован: {error}. Статус: {post.status}"
         status = post.status
         await s.commit()
         try:
@@ -262,7 +330,7 @@ async def run_due(sm: async_sessionmaker[AsyncSession], publisher: Any, notifier
     out = {}
     for pid in ids:
         try:
-            out[str(pid)] = await publish_one(sm, pid, publisher, notifier)
+            out[str(pid)] = await publish_one(sm, pid, publisher, notifier, due_by=now)
         except Exception:  # noqa: BLE001 — один пост не должен останавливать остальные
             log.exception("Ошибка публикации %s", pid)
             out[str(pid)] = "error"
@@ -275,10 +343,12 @@ async def recover_stuck(sm: async_sessionmaker[AsyncSession], *, older_than: tim
     Автоповтор не делаем: сообщение могло уйти в Telegram до падения, повтор дал бы дубль."""
     cutoff = datetime.now(timezone.utc) - older_than
     async with sm() as s, s.begin():
-        rows = (await s.scalars(select(Post).where(Post.status == P.PUBLISHING, Post.updated_at < cutoff))).all()
+        rows = (await s.scalars(select(Post).where(Post.status == P.PUBLISHING, Post.updated_at < cutoff)
+                                .with_for_update(skip_locked=True))).all()
         for p in rows:
             p.status = P.FAILED
-            p.last_error = "Публикация прервана: проверьте канал вручную и запланируйте снова при необходимости"
+            p.meta = {**(p.meta or {}), "publish_uncertain": True}
+            p.last_error = "Публикация прервана: проверьте канал вручную"
         return len(rows)
 
 

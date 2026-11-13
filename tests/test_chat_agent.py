@@ -13,7 +13,7 @@ from app.ai.agent import parse_action
 from app.ai.connectors.base import AIConnectionUnavailable, MockConnector
 from app.ai.orchestrator import Orchestrator
 from app.db.models import ConversationSummary, Document, Memory, Message, Post
-from app.rag.index import HybridSearcher, index_documents
+from app.rag.index import HybridSearcher, SearchHit, index_documents
 from app.services import memory as mem
 from app.services import posts as posts_svc
 from app.services.sources import add_source, create_company
@@ -108,6 +108,75 @@ async def test_history_and_memory_survive_restart(pg):
         assert "Сообщение компании Б" not in " ".join(sent) + mock.calls[0]["instructions"]
     finally:
         await engine2.dispose()
+
+
+async def test_anaphoric_followup_reuses_previous_subject_for_rag(pg):
+    _, sm = pg
+    a, b = await seed(sm)
+    first = "Какое светопропускание у Ultraview R?"
+    followup = "О каком продукте я спрашивала? Повтори ответ."
+    url = "https://a.ru/1"
+
+    class Searcher:
+        queries = []
+
+        async def search(self, session, company_id, query, **kwargs):
+            self.queries.append((company_id, query))
+            if company_id != a or "Ultraview R" not in query:
+                return []
+            return [SearchHit(1, "1", "Ultraview R: LT 91%", "Ultraview R", url,
+                              "website", False, None, 1.0, 1, 1)]
+
+    searcher = Searcher()
+    connector = MockConnector([
+        j(answer=f"Ultraview R: 91% [1] {url}"), j(answer="Кирпич"),
+        j(answer=f"Ultraview R: 91% [1] {url}"), j(answer="Оконные продукты"),
+    ])
+    agent = Orchestrator(connector, searcher)
+    async with sm() as session:
+        await agent.chat(session, a, first)
+        await agent.chat(session, b, "Сколько стоит кирпич?")
+        answer = await agent.chat(session, a, followup)
+        await agent.chat(session, a, "Что входит в ассортимент оконных продуктов?")
+
+    assert searcher.queries == [(a, first), (b, "Сколько стоит кирпич?"), (a, f"{first}\n{followup}"),
+                                (a, "Что входит в ассортимент оконных продуктов?")]
+    assert answer.llm_calls == 1 and answer.citations[0]["url"] == url
+    assert "Ultraview R: LT 91%" in connector.calls[2]["instructions"]
+    assert "Кирпич" not in " ".join(m.content for m in connector.calls[2]["messages"])
+
+
+async def test_tool_and_nested_generation_share_citation_numbers_with_initial_rag(pg):
+    _, sm = pg
+    a, _ = await seed(sm)
+    other_url = "https://a.ru/other"
+    product_url = "https://a.ru/product"
+
+    class Searcher:
+        async def search(self, session, company_id, query, **kwargs):
+            assert company_id == a
+            if query == "Первый запрос":
+                return [SearchHit(1, "1", "Другой продукт", "Другой продукт", other_url, "website",
+                                  False, None, 1.0, 1, 1)]
+            return [SearchHit(i, "2", f"Характеристика {i}", "Ultraview R", product_url, "website",
+                              False, None, 1.0, 1, 1) for i in (2, 3)]
+
+    connector = MockConnector([
+        j(tool="search_company_knowledge", args={"query": "Ultraview R"}),
+        j(tool="create_post_draft", args={"topic": "Ultraview R"}),
+        f"Текст черновика с источником [2] {product_url}",
+        j(answer=f"Готово [1] {product_url}. Чужая ссылка [1] https://not-in-index.test/page"),
+    ])
+    async with sm() as session:
+        answer = await Orchestrator(connector, Searcher()).chat(session, a, "Первый запрос")
+        saved = (await mem.history(session, a))[-1]
+
+    tool_output = next(m.content for m in connector.calls[1]["messages"] if "Результат инструмента" in m.content)
+    assert tool_output.count('"n": 2') == 2
+    assert f"[2] Ultraview R ({product_url})" in connector.calls[2]["messages"][0].content
+    assert answer.answer.startswith(f"Готово [2] {product_url}")
+    assert answer.citations == [{"n": 2, "title": "Ultraview R", "url": product_url, "source_type": "website"}]
+    assert saved.meta["citations"] == answer.citations and saved.content == answer.answer
 
 
 async def test_ai_unavailable_keeps_user_message(pg):

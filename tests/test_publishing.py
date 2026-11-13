@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from sqlalchemy import select
 
-from app.db.models import Memory, Post
+from app.db.models import Company, Memory, Post
 from app.services import posts as P
 from app.services.publisher import LogNotifier, TelegramBotAPI, TelegramPublisher, run_due
 from app.services.sources import create_company
@@ -37,11 +37,13 @@ def make(fake):
     return TelegramPublisher(api), LogNotifier()
 
 
-async def scheduled_post(sm, *, at=None, text="Текст поста", channel="@salstek"):
+async def scheduled_post(sm, *, at=None, text="Текст поста", channel="@salstek", image_path=None):
     async with sm() as s, s.begin():
         c = await create_company(s, "Компания", slug="c")
         c.settings = {"telegram_channel": channel}
         p = await P.create_draft(s, c.id, text=text, topic="Тема")
+        if image_path is not None:
+            await P.edit_content(s, p, image_path=str(image_path))
         await P.approve(s, p, user_id=None, scheduled_at=at or datetime.now(timezone.utc) - timedelta(seconds=1))
         return c.id, p.id
 
@@ -130,3 +132,62 @@ async def test_photo_post(pg, tmp_path):
     pub, notifier = make(fake)
     await run_due(sm, pub, notifier)
     assert fake.calls[0][0] == "sendPhoto" and b"caption" in fake.calls[0][1].content
+
+
+async def test_approved_destination_is_preserved_when_company_channel_changes(pg):
+    _, sm = pg
+    cid, pid = await scheduled_post(sm)
+    async with sm() as s, s.begin():
+        company = await s.get(Company, cid)
+        company.settings = {"channels": {"telegram": "@new_channel"}}
+    fake = FakeTelegram()
+    pub, notifier = make(fake)
+    assert await run_due(sm, pub, notifier) == {str(pid): "published"}
+    assert json.loads(fake.calls[0][1].content)["chat_id"] == "@salstek"
+
+
+async def test_telegram_retries_only_text_if_photo_was_already_sent(pg, tmp_path):
+    _, sm = pg
+    image = tmp_path / "post.png"
+    image.write_bytes(b"test image")
+    _, pid = await scheduled_post(sm, text="Т" * 1025, image_path=image)
+    fake = FakeTelegram()
+
+    def one_rate_limit(request):
+        if len(fake.calls) == 1:
+            fake.fail_first = 1
+        return fake(request)
+
+    pub, notifier = make(one_rate_limit)
+    assert await run_due(sm, pub, notifier) == {str(pid): "scheduled"}
+    async with sm() as s:
+        post = await s.get(Post, pid)
+        assert post.meta["telegram_photo_id"] == "101"
+        retry_at = post.scheduled_at
+    assert await run_due(sm, pub, notifier, now=retry_at + timedelta(seconds=1)) == {str(pid): "published"}
+    assert [method for method, _ in fake.calls] == ["sendPhoto", "sendMessage", "sendMessage"]
+
+
+async def test_telegram_does_not_retry_an_ambiguous_send(pg, tmp_path):
+    _, sm = pg
+    image = tmp_path / "post.png"
+    image.write_bytes(b"test image")
+    _, pid = await scheduled_post(sm, text="Т" * 1025, image_path=image)
+    calls = []
+    fake = FakeTelegram()
+
+    def lost_response(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        calls.append(method)
+        if method == "sendMessage":
+            raise httpx.ReadTimeout("test timeout", request=request)
+        return fake(request)
+
+    pub, notifier = make(lost_response)
+    assert await run_due(sm, pub, notifier) == {str(pid): "failed"}
+    assert await run_due(sm, pub, notifier, now=datetime.now(timezone.utc) + timedelta(days=1)) == {}
+    assert calls == ["sendPhoto", "sendMessage"]
+    async with sm() as s:
+        post = await s.get(Post, pid)
+        assert post.meta["telegram_photo_id"] == "101" and post.meta["publish_uncertain"]
+    assert "Результат отправки неизвестен" in notifier.sent[0][1]

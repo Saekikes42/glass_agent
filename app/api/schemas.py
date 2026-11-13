@@ -132,6 +132,8 @@ class PostOut(Out):
     scheduled_at: str | None = None
     published_at: str | None = None
     external_message_id: str | None = None
+    target_chat_id: str | None = None
+    review_token: str | None = None
     external_url: str | None = None
     publish_attempts: int
     last_error: str | None = None

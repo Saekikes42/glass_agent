@@ -22,7 +22,7 @@ def msg(mid, text="", grouped=None, photo=False, views=10, reactions=None, actio
 
 
 def test_parse_channel_ref():
-    assert parse_channel_ref("https://t.me/+5LuOqWJkZDU0N2Ri/s/10") == ("invite", "5LuOqWJkZDU0N2Ri")
+    assert parse_channel_ref("https://t.me/+TestOnlyInvite01/s/10") == ("invite", "TestOnlyInvite01")
     assert parse_channel_ref("https://t.me/joinchat/AbCdEf123") == ("invite", "AbCdEf123")
     assert parse_channel_ref("https://t.me/s/durov") == ("username", "durov")
     assert parse_channel_ref("@salstek") == ("username", "salstek")
@@ -45,6 +45,17 @@ def test_messages_to_documents_album_and_metrics():
     assert a.metadata["hashtags"] == ["завод", "команда"]
     assert b.metadata["media_types"] == ["photo", "photo"] and b.metadata["message_ids"] == [2, 3]
     assert b.metrics["views"] == 55
+
+
+def test_telethon_keeps_missing_album_metrics_distinct_from_zero():
+    first = msg(1, "Фото", grouped=77, photo=True, views=None)
+    second = msg(2, "", grouped=77, photo=True, views=0)
+    first.forwards = second.forwards = None
+    first.replies = None
+    second.replies = NS(replies=0)
+    doc, = messages_to_documents([first, second], channel_id=42, channel_title="Стекло", username=None)
+    assert doc.metrics == {"views": 0, "forwards": None, "replies": 0,
+                           "reactions": {}, "reactions_total": None}
 
 
 def test_telethon_requires_credentials():

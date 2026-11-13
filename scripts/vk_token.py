@@ -68,7 +68,7 @@ async def check(token: str, group: str) -> str:
     parser = VKParser(token, api_version=s.vk_api_version, api_base=s.vk_api_base)
     async with httpx.AsyncClient(timeout=20) as client:
         g = await parser.get_group(client, group)
-        wall = await parser.call(client, "wall.get", owner_id=-int(g["id"]), count=1)
+        wall = await parser.call(client, "wall.get", owner_id=-int(g["id"]), domain=g.get("screen_name"), count=1)
     return f"«{g.get('name')}» — подписчиков {g.get('members_count')}, записей на стене {wall.get('count')}"
 
 
@@ -100,7 +100,7 @@ def main() -> int:
         return 3
     save_to_env(token)
     print(f"Ключ работает: {info}\nСохранён в .env (VK_ACCESS_TOKEN). Теперь:\n"
-          f"  .venv/bin/python -m scripts.parse_sources --company salavatsteklo vk https://vk.ru/{a.group}")
+          f"  python -m scripts.parse_sources --company salavatsteklo vk https://vk.ru/{a.group}")
     return 0
 
 

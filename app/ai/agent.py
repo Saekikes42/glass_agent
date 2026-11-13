@@ -90,16 +90,24 @@ class Agent:
                 name = str(action.get("tool", ""))
                 args = action.get("args") if isinstance(action.get("args"), dict) else {}
                 msgs.append(AIMessage("assistant", json.dumps({"tool": name, "args": args}, ensure_ascii=False)))
+                created_count, callbacks_count = len(ctx.created_post_ids), len(ctx.after_commit)
                 try:
-                    result = await call_tool(ctx, name, args)
-                    payload, ok = json.dumps(result, ensure_ascii=False, default=str), True
+                    async with ctx.session.begin_nested():
+                        result = await call_tool(ctx, name, args)
+                        payload = json.dumps(result, ensure_ascii=False, default=str)
+                    ok = True
                 except BudgetExceeded:
+                    del ctx.created_post_ids[created_count:]
+                    del ctx.after_commit[callbacks_count:]
                     raise
                 except ToolError as e:
                     payload, ok = json.dumps({"error": str(e)}, ensure_ascii=False), False
                 except Exception as e:  # noqa: BLE001 — ошибка инструмента не должна ронять диалог
                     log.exception("Инструмент %s упал", name)
                     payload, ok = json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False), False
+                if not ok:
+                    del ctx.created_post_ids[created_count:]
+                    del ctx.after_commit[callbacks_count:]
                 if ctx.last_result is not None:
                     mock_seen |= ctx.last_result.is_mock
                 if len(payload) > self.max_result_chars:

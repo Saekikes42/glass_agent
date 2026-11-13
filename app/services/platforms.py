@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.db.models import Company, Post
 
-from .publisher import PublishError, TelegramBotAPI, TelegramPublisher
+from .publisher import PublishError, TelegramBotAPI, TelegramPublisher, request_may_have_arrived
 
 log = logging.getLogger(__name__)
 PLATFORMS = ("telegram", "vk", "max")
@@ -34,16 +34,6 @@ class Publisher(Protocol):
 
 def _raw(token: SecretStr | str | None) -> str | None:
     return token.get_secret_value() if isinstance(token, SecretStr) else token
-
-
-def target_for(post: Post, company: Company) -> str | None:
-    if post.target_chat_id:
-        return post.target_chat_id
-    settings = company.settings or {}
-    target = (settings.get("channels") or {}).get(post.platform)
-    if not target and post.platform == "telegram":
-        target = settings.get("telegram_channel")
-    return str(target) if target else None
 
 
 # --------------------------------------------------------------------------- ВКонтакте
@@ -59,6 +49,7 @@ class VKPublisher:
         from app.parsers.vk_parser import VKParser
 
         self.api = VKParser(token, api_version=api_version, api_base=api_base, transport=transport)
+        self.send_api = VKParser(token, api_version=api_version, api_base=api_base, max_retries=0)
         self._transport = transport
 
     async def _group_id(self, client: httpx.AsyncClient, target: str) -> int:
@@ -91,16 +82,33 @@ class VKPublisher:
                     saved = await self.api.call(client, "photos.saveWallPhoto", group_id=gid, photo=uploaded["photo"],
                                                 server=uploaded["server"], hash=uploaded["hash"])
                     attachments = f"photo{saved[0]['owner_id']}_{saved[0]['id']}"
-                res = await self.api.call(client, "wall.post", owner_id=-gid, from_group=1, message=text,
-                                          attachments=attachments)
+                try:
+                    res = await self.send_api.call(client, "wall.post", owner_id=-gid, from_group=1, message=text,
+                                                   attachments=attachments)
+                except (KeyError, ValueError) as e:
+                    raise PublishError("VK: неожиданный ответ wall.post", uncertain=True) from e
         except VKRateLimitError as e:
+            if e.method == "wall.post" and e.code == 10:
+                raise PublishError("VK: внутренняя ошибка wall.post", uncertain=True) from e
             raise PublishError(str(e), retry_after=60) from e
         except (VKAuthError, VKAccessError) as e:
             raise PublishError(str(e), permanent=True) from e
         except VKError as e:
+            if e.method == "wall.post" and e.code == -1:
+                cause = e.__cause__
+                uncertain = not isinstance(cause, httpx.TransportError) or request_may_have_arrived(cause)
+                if isinstance(cause, httpx.HTTPStatusError):
+                    status = cause.response.status_code
+                    if status == 429:
+                        raise PublishError("VK: превышен лимит запросов", retry_after=60) from e
+                    if 400 <= status < 500:
+                        raise PublishError(f"VK: HTTP {status}", permanent=True) from e
+                raise PublishError("VK: сетевая ошибка wall.post", uncertain=uncertain) from e
             raise PublishError(str(e), permanent=e.code in (14, 15, 214, 219, 220, 222)) from e
         except httpx.HTTPError as e:
             raise PublishError(f"VK: сеть {type(e).__name__}") from e
+        if not isinstance(res, dict) or not res.get("post_id"):
+            raise PublishError("VK: в ответе нет post_id", uncertain=True)
         pid = res["post_id"]
         return {"message_id": str(pid), "url": f"https://vk.com/wall-{gid}_{pid}", "chat_id": f"-{gid}"}
 
@@ -124,11 +132,13 @@ class MaxAPI:
         return httpx.AsyncClient(timeout=timeout, transport=self._transport, headers={"Authorization": self._token})
 
     async def request(self, method: str, path: str, *, params: dict | None = None, json: Any = None) -> Any:
+        sending = method == "POST" and path == "/messages"
         async with self._client() as c:
             try:
                 r = await c.request(method, f"{self.api_base}{path}", params=params, json=json)
             except httpx.TransportError as e:
-                raise PublishError(f"MAX: сеть {type(e).__name__}") from e
+                raise PublishError(f"MAX: сеть {type(e).__name__}",
+                                   uncertain=sending and request_may_have_arrived(e)) from e
         try:
             body = r.json()
         except ValueError:
@@ -138,7 +148,8 @@ class MaxAPI:
         if r.status_code >= 400 or (isinstance(body, dict) and body.get("success") is False):
             code = body.get("code") if isinstance(body, dict) else None
             err = PublishError(f"MAX {r.status_code} {code or ''}: {body.get('message', '') if isinstance(body, dict) else ''}",
-                               permanent=r.status_code in (400, 401, 403, 404, 405, 415))
+                               permanent=r.status_code in (400, 401, 403, 404, 405, 415),
+                               uncertain=sending and r.status_code >= 500)
             err.code = code  # type: ignore[attr-defined]
             raise err
         return body
@@ -186,14 +197,14 @@ class MaxPublisher:
                 break
             except PublishError as e:
                 # вложение ещё обрабатывается — пауза с ростом интервала (документация MAX)
-                if getattr(e, "code", None) == "attachment.not.ready" and attempt < self.attachment_retries:
+                if not e.uncertain and getattr(e, "code", None) == "attachment.not.ready" and attempt < self.attachment_retries:
                     await asyncio.sleep(self.retry_base_s * 2 ** attempt)
                     continue
                 raise
-        msg = res.get("message") or {}
+        msg = (res.get("message") or {}) if isinstance(res, dict) else {}
         mid = (msg.get("body") or {}).get("mid")
         if not mid:
-            raise PublishError("MAX: в ответе нет message.body.mid")
+            raise PublishError("MAX: в ответе нет message.body.mid", uncertain=True)
         url = msg.get("url") or (msg.get("stat") or {}).get("url")
         return {"message_id": str(mid), "url": url, "chat_id": str(target)}
 
@@ -213,7 +224,7 @@ class PublisherHub:
 
         if post.platform not in PLATFORMS:
             raise PublishError(f"Площадка {post.platform} не поддерживается", permanent=True)
-        target = target_for(post, company)
+        target = (post.meta or {}).get("approval_target")
         if not target:
             raise PublishError(f"Не указан канал {post.platform}: settings.channels.{post.platform} компании",
                                permanent=True)

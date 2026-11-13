@@ -17,13 +17,14 @@ from app.db.session import get_sessionmaker, init_db
 from app.rag.embeddings import get_embedder
 from app.rag.index import HybridSearcher
 from app.services.platforms import PublisherHub
-from app.services.publisher import LogNotifier, TelegramBotAPI, TelegramNotifier, recover_stuck, run_due
+from app.services.publisher import recover_stuck, run_due
+from app.services.notifications import get_notifier
 from app.services.tasks import TaskDeps, run_due_tasks, scheduler_loop_all
 
 
 def build_deps():
     s = get_settings()
-    notifier = TelegramNotifier(TelegramBotAPI(s.tg_bot_token)) if s.tg_bot_token else LogNotifier()
+    notifier = get_notifier()
     embedder = get_embedder()
     orch = Orchestrator(get_ai_connector(), HybridSearcher(embedder), max_steps=s.agent_max_steps,
                         max_llm_calls=s.agent_max_llm_calls, max_seconds=s.agent_max_seconds, notifier=notifier)

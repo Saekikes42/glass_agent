@@ -28,6 +28,8 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import httpx
 import jwt
 
+from .token_storage import _write_private
+
 AUTH_ISSUER = "https://auth.openai.com"
 AUTHORIZE_URL = "https://auth.openai.com/api/accounts/authorize"
 TOKEN_URL = "https://auth.openai.com/api/accounts/oauth/token"
@@ -73,14 +75,16 @@ def make_pkce() -> tuple[str, str]:
 def load_or_create_host_id(path: Path) -> str:
     """Стабильный непрозрачный идентификатор хоста (urn:uuid:<UUIDv4>), один на машину/VM."""
     path = Path(path)
-    if path.exists():
-        value = path.read_text().strip()
-        if value:
-            return value
-    path.parent.mkdir(parents=True, exist_ok=True)
     value = f"urn:uuid:{uuid.uuid4()}"
-    path.write_text(value)
-    path.chmod(0o600)
+    if not path.exists():
+        try:
+            _write_private(path, value.encode("ascii"), replace=False)
+        except FileExistsError:
+            pass
+    existing = path.read_text(encoding="ascii").strip()
+    if existing:
+        return existing
+    _write_private(path, value.encode("ascii"))
     return value
 
 
@@ -153,6 +157,8 @@ def parse_callback(query: str, attempt: AuthAttempt) -> CallbackResult:
         if not client_id or client_id == DYNAMIC_CLIENT_ID:
             raise RegistrationIncomplete("Регистрация не завершена: callback не вернул выданный client_id")
     else:
+        if client_id and client_id != attempt.client_id:
+            raise OAuthError("Callback вернул другой client_id", error="client_id_mismatch")
         client_id = attempt.client_id
     return CallbackResult(code=code, client_id=client_id, granted_scope=q.get("scope"))
 
@@ -163,7 +169,7 @@ async def _token_request(client: httpx.AsyncClient, data: dict[str, str]) -> dic
         body = r.json()
     except ValueError:
         body = {}
-    if r.status_code != 200 or "access_token" not in body:
+    if r.status_code != 200 or not isinstance(body, dict) or not body.get("access_token"):
         err = body.get("error") if isinstance(body, dict) else None
         if isinstance(err, dict):
             err = err.get("code") or err.get("type")
@@ -221,26 +227,23 @@ async def revoke_refresh_token(client: httpx.AsyncClient, *, client_id: str, ref
 async def validate_id_token(client: httpx.AsyncClient, id_token: str, *, client_id: str,
                             nonce: str | None) -> dict[str, Any]:
     """Проверяет подпись (JWKS), iss, aud, exp и nonce id_token."""
-    conf = await discovery(client)
-    jwks = (await client.get(conf["jwks_uri"])).json()
-    header = jwt.get_unverified_header(id_token)
-    key = next((k for k in jwks.get("keys", []) if k.get("kid") == header.get("kid")), None)
-    if key is None:
-        raise OAuthError("Ключ подписи id_token не найден в JWKS")
-    public_key = jwt.PyJWK(key).key
-    claims = jwt.decode(id_token, public_key, algorithms=[header.get("alg", "RS256")], audience=client_id,
-                        issuer=conf.get("issuer", AUTH_ISSUER), options={"require": ["exp", "iss", "aud", "sub"]})
+    try:
+        conf = await discovery(client)
+        response = await client.get(conf["jwks_uri"])
+        response.raise_for_status()
+        header = jwt.get_unverified_header(id_token)
+        key = next((k for k in response.json().get("keys", [])
+                    if header.get("kid") and k.get("kid") == header["kid"]), None)
+        if key is None:
+            raise OAuthError("Ключ подписи id_token не найден в JWKS")
+        signing_key = jwt.PyJWK(key)
+        claims = jwt.decode(id_token, signing_key.key, algorithms=[signing_key.algorithm_name], audience=client_id,
+                            issuer=AUTH_ISSUER, options={"require": ["exp", "iss", "aud", "sub"]})
+    except (httpx.HTTPError, jwt.PyJWTError, KeyError, TypeError, ValueError) as exc:
+        raise OAuthError("Не удалось проверить подпись или данные id_token", error="invalid_id_token") from exc
     if nonce is not None and claims.get("nonce") != nonce:
         raise OAuthError("nonce в id_token не совпадает")
     return claims
-
-
-def unverified_claims(token: str) -> dict[str, Any]:
-    """Только для отображения (срок, scope). Для доверия к личности используйте validate_id_token."""
-    try:
-        return jwt.decode(token, options={"verify_signature": False})
-    except jwt.PyJWTError:
-        return {}
 
 
 class LoopbackCallbackServer:

@@ -32,12 +32,12 @@ errors-and-recovery, preview-limitations, self-hosted-vms), request-client-id.
 | Начало авторизации | `oauth.build_authorization_url`: PKCE S256, state, nonce, `ext_agent_host_id`, `agent_name_hint` |
 | OAuth callback | `oauth.LoopbackCallbackServer` на `http://127.0.0.1:1455/auth/callback`, `parse_callback` (проверка state, отказ, незавершённая регистрация) |
 | Проверка разрешений | scope `chatgpt.tokens.use.direct` проверяется до каждого запроса, иначе `AI_CONNECTION_UNAVAILABLE` |
-| Защищённое хранение | `token_storage.EncryptedTokenStorage`: Fernet, файл 0600, атомарная запись; токены не попадают в API и логи |
+| Защищённое хранение | `token_storage.EncryptedTokenStorage` шифрует токены с Fernet и записывает их атомарно. Новые файлы получают режим 0600 на Unix и ACL текущего пользователя на Windows. API и логи не содержат токенов |
 | Обновление токенов | `token_refresh.TokenManager`: за 5 минут до истечения; одновременные запросы ждут одного обновления (блокировка в процессе и файловая между процессами); refresh-токен ротируется; при `invalid_grant` и подобных — `reauth_required` |
 | Запросы к модели | `connectors/chatgpt_plus.py`: `POST /v1/responses`, `store:false`, `stream:true`, история целиком в `input`, без `temperature` и `max_output_tokens` |
 | Потоковые ответы | разбор SSE: `response.output_text.delta`, `response.completed`, `response.failed`, `response.incomplete` |
 | Ошибки и лимиты | `subscription_sharing_*` → `AIUsageLimitExceeded` (с паузой запросов), `AIConnectionUnavailable`, `AITemporarilyUnavailable`; при 401 — одно обновление токена и повтор |
-| Отключение аккаунта | отзыв refresh-токена через `revocation_endpoint` из discovery и удаление токенов |
+| Отключение аккаунта | Запрос отзыва refresh-токена через `revocation_endpoint` из discovery, удаление локальных токенов и сообщение о результате отзыва |
 | Без платного API | `OPENAI_API_KEY` нигде не читается, это проверяется тестом |
 
 ## Ограничения подписки (Preview)
@@ -53,6 +53,7 @@ errors-and-recovery, preview-limitations, self-hosted-vms), request-client-id.
   с ограниченной паузой (2 повтора, 1 и 3 с), учётные данные при этом не удаляются.
 - `earliest_refresh_at` из ответа токена учитывается: раньше этого времени токен не обновляется, пока действует.
 - Для учётных данных, перенесённых на VM, OpenAI пока не поддерживает отдельный учёт расхода и отзыв доступа по хосту.
+- Glass Agent хранит одну активную регистрацию ChatGPT на установку. Отключение или ошибка, требующая повторной авторизации, удаляет локальную запись вместе с её `client_id`. Следующее подключение заново регистрирует клиент. Переключение между сохранёнными аккаунтами не реализовано.
 
 ## Как проверить на реальном аккаунте
 
@@ -63,5 +64,15 @@ errors-and-recovery, preview-limitations, self-hosted-vms), request-client-id.
 .venv/bin/python -m scripts.chatgpt_login --logout
 ```
 
+На Windows используйте `.venv\Scripts\python.exe` в тех же командах. Если браузер не вернул OAuth-ответ
+за пять минут, CLI завершится с сообщением и кодом 2. Команда `--logout` удаляет локальные токены и возвращает
+код 1, если OpenAI не подтвердил отзыв. В этом случае доступ приложения можно проверить в настройках ChatGPT.
+
 Автотесты (`tests/test_chatgpt_*.py`) используют **замоканный** сервер OpenAI. Они не подтверждают реальную
 интеграцию: она считается проверенной только после успешного `--test` на реальном аккаунте Plus.
+
+13.11.2026 выполнена живая проверка локальной установки: официальный вход завершён,
+получено разрешение `chatgpt.tokens.use.direct`, загружен список доступных моделей.
+Модель `gpt-6.1-sol` вернула ответ «Glass Agent подключён». Через тот же коннектор
+проверены поиск по базе Салаватстекло, сохранение истории в PostgreSQL и создание
+тестового черновика с изображением Pillow. Обычный API-ключ не использовался.

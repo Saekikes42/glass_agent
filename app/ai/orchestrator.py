@@ -22,7 +22,7 @@ from app.services import memory as mem
 from .agent import Agent, AgentResult
 from .connectors.base import AIConnector, AIError
 from .context_builder import build_context
-from .tools import Budget, ToolContext
+from .tools import Budget, BudgetExceeded, ToolContext
 
 log = logging.getLogger(__name__)
 
@@ -72,15 +72,25 @@ class Orchestrator:
                           user_id=user_id, budget=Budget(self.max_llm_calls, self.max_seconds),
                           notifier=self.notifier)
         try:
-            built = await build_context(session, company, conv, text, self.searcher, self.memory_cfg)
-            result: AgentResult = await Agent(self.connector, max_steps=self.max_steps).run(
-                ctx, built.instructions, built.messages)
+            async with ctx.budget.deadline():
+                built = await build_context(session, company, conv, text, self.searcher, self.memory_cfg,
+                                            current_message_id=user_msg_id, ctx=ctx)
+        except BudgetExceeded as e:
+            await session.rollback()
+            conv = await mem.get_conversation(session, company_id)
+            result = AgentResult(answer=f"Остановлено: {e}.", stopped_reason="budget")
+            citations = []
         except AIError:
             await session.rollback()
             raise
+        else:
+            try:
+                result = await Agent(self.connector, max_steps=self.max_steps).run(ctx, built.instructions, built.messages)
+            except AIError:
+                await session.rollback()
+                raise
+            result.answer, citations = ctx.answer_sources(result.answer)
 
-        citations = [{"n": i, "title": h.title, "url": h.url, "source_type": h.source_type}
-                     for i, h in enumerate(built.rag_hits, 1)]
         steps = [{"tool": s.tool, "args": s.args, "ok": s.ok} for s in result.steps]
         reply_msg = await mem.add_message(
             session, conv, "assistant", result.answer, provider=result.provider, model=result.model,
@@ -108,7 +118,7 @@ class Orchestrator:
                 log.exception("Действие после ответа не выполнено")
 
         summary_created = False
-        if ctx.budget.remaining_calls > 0:
+        if ctx.budget.remaining_calls > 0 and result.stopped_reason != "budget":
             try:
                 summary_created = await mem.summarize_if_needed(session, conv, ctx.metered,
                                                                 self.memory_cfg) is not None

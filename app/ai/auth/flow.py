@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 
 from .oauth import (
-    DYNAMIC_CLIENT_ID, AuthAttempt, CallbackResult, LoopbackCallbackServer, OAuthError, build_authorization_url,
+    DYNAMIC_CLIENT_ID, REQUIRED_SCOPE, AuthAttempt, CallbackResult, LoopbackCallbackServer, OAuthError, build_authorization_url,
     exchange_code, load_or_create_host_id, parse_callback, validate_id_token,
 )
 from .token_refresh import TokenManager
@@ -29,16 +29,24 @@ async def finish_login(cb: CallbackResult, attempt: AuthAttempt, host_id: str, t
     client = client or httpx.AsyncClient(timeout=30)
     try:
         body = await exchange_code(client, client_id=cb.client_id, code=cb.code, attempt=attempt)
-        claims: dict[str, Any] = {}
-        if body.get("id_token"):
-            claims = await validate_id_token(client, body["id_token"], client_id=cb.client_id, nonce=attempt.nonce)
+        id_token = body.get("id_token")
+        if not isinstance(id_token, str) or not id_token:
+            raise OAuthError("OpenAI не вернул id_token", error="invalid_id_token")
+        claims = await validate_id_token(client, id_token, client_id=cb.client_id, nonce=attempt.nonce)
     finally:
         if own:
             await client.aclose()
-    if "scope" not in body and cb.granted_scope:
-        body["scope"] = cb.granted_scope
     creds = ChatGPTCredentials.from_token_response(body, client_id=cb.client_id, host_id=host_id, claims=claims)
-    tm.storage.save(creds)
+    if {"offline_access", REQUIRED_SCOPE}.intersection(creds.scopes) and not creds.refresh_token:
+        raise OAuthError("OpenAI не вернул refresh token", error="missing_refresh_token")
+    async with tm.locked():
+        current = tm.load()
+        if not attempt.is_registration and (
+            current is None or current.client_id != cb.client_id
+            or (current.subject is not None and current.subject != creds.subject)
+        ):
+            raise OAuthError("Аккаунт ChatGPT изменился во время входа", error="account_mismatch")
+        tm.storage.save(creds)
     return creds
 
 
@@ -65,15 +73,20 @@ async def start_login(tm: TokenManager, *, host_id_path, agent_name: str, port: 
     await server.__aenter__()  # слушать до открытия браузера (требование документации)
     attempt = AuthAttempt(client_id=client_id, redirect_uri=server.redirect_uri)
     url = build_authorization_url(attempt, host_id=host_id, agent_name=agent_name,
-                                  login_hint=prev.email if prev else None, prompt="consent" if prev else None)
+                                  login_hint=prev.email if prev else None,
+                                  prompt="consent" if prev and REQUIRED_SCOPE not in prev.scopes else None)
     sess = LoginSession(url=url, redirect_uri=server.redirect_uri)
 
     async def wait() -> None:
         try:
             query = await server.wait(timeout)
             cb = parse_callback(query, attempt)
-            await finish_login(cb, attempt, host_id, tm)
-            sess.status = "connected"
+            creds = await finish_login(cb, attempt, host_id, tm)
+            if REQUIRED_SCOPE in creds.scopes:
+                sess.status = "connected"
+            else:
+                sess.status = "error"
+                sess.error = f"AI_CONNECTION_UNAVAILABLE: разрешение {REQUIRED_SCOPE} не выдано"
         except asyncio.TimeoutError:
             sess.status, sess.error = "error", "Время ожидания входа истекло"
         except OAuthError as e:

@@ -19,7 +19,7 @@ from typing import Any, AsyncIterator
 
 import httpx
 
-from ..auth.oauth import REQUIRED_SCOPE, revoke_refresh_token
+from ..auth.oauth import REQUIRED_SCOPE, OAuthError, revoke_refresh_token
 from ..auth.token_refresh import TokenManager
 from .base import (
     AIConnectionUnavailable,
@@ -177,7 +177,8 @@ class ChatGPTPlusConnector:
                 }) as r:
                     if r.status_code == 401 and not refreshed:
                         refreshed = True  # одно принудительное обновление токена и повтор
-                        creds = await self.tokens.get_credentials(force_refresh=True)
+                        creds = await self.tokens.get_credentials(
+                            force_refresh=True, rejected_access_token=creds.access_token)
                         continue
                     if r.status_code != 200:
                         await r.aread()
@@ -204,8 +205,11 @@ class ChatGPTPlusConnector:
         async for event, data in self._events(messages, instructions, model):
             if event == "response.output_text.delta":
                 yield data.get("delta", "")
+            elif event == "response.completed":
+                return
             elif event in ("response.failed", "error", "response.incomplete"):
                 raise self._stream_error(event, data)
+        raise AITemporarilyUnavailable("Поток завершился без response.completed", reason="stream_cut")
 
     async def complete(self, messages: list[AIMessage], *, instructions: str | None = None,
                        model: str | None = None) -> AIResult:
@@ -236,16 +240,20 @@ class ChatGPTPlusConnector:
 
     # ------------------------------------------------------------------ disconnect
 
-    async def disconnect(self) -> None:
-        creds = self.tokens.load()
-        if creds is not None:
-            try:
-                async with self._client(30) as client:
-                    await revoke_refresh_token(client, client_id=creds.client_id, refresh_token=creds.refresh_token)
-            except Exception as e:  # noqa: BLE001 — локально удаляем в любом случае
-                log.warning("Отзыв токена не удался: %s", e)
-        self.tokens.storage.clear()
+    async def disconnect(self) -> bool:
+        confirmed = True
+        async with self.tokens.locked():
+            creds = self.tokens.load()
+            if creds is not None and creds.refresh_token:
+                try:
+                    async with self._client(30) as client:
+                        await revoke_refresh_token(client, client_id=creds.client_id, refresh_token=creds.refresh_token)
+                except (OAuthError, httpx.HTTPError) as exc:
+                    confirmed = False
+                    log.warning("OpenAI не подтвердил отзыв сессии: %s", type(exc).__name__)
+            self.tokens.storage.clear()
         self._models_cache = None
+        return confirmed
 
 
 def _json(r: httpx.Response) -> Any:

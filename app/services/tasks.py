@@ -167,11 +167,13 @@ async def _run_report(sm, task: ScheduledTask, deps: TaskDeps) -> tuple[dict[str
 
 
 async def _run_sync(sm, task: ScheduledTask, deps: TaskDeps) -> tuple[dict[str, Any], str]:
-    from .sources import sync_source
+    from .sources import STALE_SYNC_S, sync_source
 
     types = task.params.get("types")
+    stale_before = datetime.now(timezone.utc) - timedelta(seconds=STALE_SYNC_S)
     async with sm() as s:
-        q = select(Source).where(Source.company_id == task.company_id, Source.status != "syncing")
+        q = select(Source).where(Source.company_id == task.company_id,
+                                 or_(Source.status != "syncing", Source.updated_at < stale_before))
         if types:
             q = q.where(Source.type.in_(types))
         sources = (await s.scalars(q)).all()

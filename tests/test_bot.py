@@ -14,7 +14,7 @@ from app.core.config import get_settings
 from app.db.models import Company, CompanyMember, InboxItem, Post, User
 from app.rag.index import HybridSearcher
 from app.services import posts as P
-from app.services.publisher import LogNotifier, TelegramBotAPI
+from app.services.publisher import LogNotifier, TelegramBotAPI, send_approval_preview
 from app.services.sources import create_company
 
 from .conftest import HashEmbedder
@@ -35,6 +35,11 @@ class Fake:
 
     def answers(self):
         return [d["text"] for m, d in self.calls if m == "answerCallbackQuery"]
+
+    def review_button(self, action):
+        return next(button["callback_data"] for method, body in reversed(self.calls)
+                    if method == "sendMessage" for row in body.get("reply_markup", {}).get("inline_keyboard", [])
+                    for button in row if button["callback_data"].startswith(action + ":"))
 
 
 def msg(uid, text, chat_type="private", chat_id=None, **extra):
@@ -98,10 +103,11 @@ async def test_chat_approval_and_revision(pg, admin):
     await bot.handle(msg(10, "/posts"))
     assert "На согласование · Telegram" in fake.texts()[-1]
 
-    await bot.handle(cb(20, f"ap:{pid}"))
+    old_approval = fake.review_button("pn")
+    await bot.handle(cb(20, fake.review_button("ap")))
     assert fake.answers()[-1] == "Недостаточно прав"
     # на доработку: кнопка → комментарий → revision (AI недоступен в моке без ответов → сообщение об ошибке)
-    await bot.handle(cb(10, f"rv:{pid}"))
+    await bot.handle(cb(10, fake.review_button("rv")))
     assert "что доработать" in fake.texts()[-1]
     bot.orchestrator = None
     await bot.handle(msg(10, "Добавь цену"))
@@ -111,11 +117,34 @@ async def test_chat_approval_and_revision(pg, admin):
         await P.edit_content(s, p, text="Пост с ценой")
         await P.submit(s, p)
         await s.commit()
-    await bot.handle(cb(10, f"pn:{pid}", "2"))
+    await bot.handle(cb(10, old_approval, "2"))
+    assert "Материал изменился" in fake.answers()[-1]
+    await bot.handle(msg(10, "/posts"))
+    await bot.handle(cb(10, fake.review_button("pn"), "3"))
     assert fake.answers()[-1].startswith("Согласовано")
     async with sm() as s:
         p = await s.get(Post, pid)
         assert p.status == "scheduled" and P.is_approved_content(p)
+
+
+async def test_long_approval_preview_has_image_and_full_text(tmp_path):
+    from uuid import uuid4
+
+    image = tmp_path / "test.png"
+    image.write_bytes(b"test image")
+    text = "🪟" * 4000 + "Конец"
+    company = Company(settings={"channels": {"telegram": "@test_channel"}})
+    post = Post(id=uuid4(), platform="telegram", revision=2, topic="Тест", text=text,
+                image_path=str(image))
+    fake = Fake()
+    api = TelegramBotAPI("1:T", transport=httpx.MockTransport(fake))
+    await send_approval_preview(api, 1, post, company)
+
+    assert fake.calls[0][0] == "sendPhoto"
+    assert "Канал: @test_channel" in fake.texts()[0]
+    assert "".join(fake.texts()).endswith(text)
+    assert all("reply_markup" not in body for _, body in fake.calls[:-1])
+    assert len(fake.review_button("pn").encode()) <= 64
 
 
 async def test_group_comments_to_inbox(pg, admin):

@@ -6,8 +6,8 @@
 авторизации (5) и доступа (15, 18, 30, 203); инкрементальная синхронизация и
 дедупликация по owner_id+post_id.
 
-Токен: сервисный ключ доступа приложения VK (достаточно для открытых стен),
-либо ключ сообщества/пользователя.
+Токен: сервисный ключ доступа приложения VK (достаточно для открытых стен)
+или ключ пользователя с доступом к стене.
 """
 from __future__ import annotations
 
@@ -138,9 +138,9 @@ def post_to_document(post: dict[str, Any], group: dict[str, Any]) -> ParsedDocum
         published_at=datetime.fromtimestamp(post["date"], tz=timezone.utc),
         edited_at=datetime.fromtimestamp(post["edited"], tz=timezone.utc) if post.get("edited") else None,
         metrics={
-            "likes": (post.get("likes") or {}).get("count", 0),
-            "comments": (post.get("comments") or {}).get("count", 0),
-            "reposts": (post.get("reposts") or {}).get("count", 0),
+            "likes": (post.get("likes") or {}).get("count"),
+            "comments": (post.get("comments") or {}).get("count"),
+            "reposts": (post.get("reposts") or {}).get("count"),
             "views": (post.get("views") or {}).get("count"),  # может отсутствовать
         },
         metadata={
@@ -224,49 +224,85 @@ class VKParser:
             result = SyncResult(source_type=SourceType.VK, source_id=str(gid))
             state_key = f"vk:{gid}"
             state = store.get_state(state_key)
+            group_name = str(group.get("screen_name") or "").casefold()
+            foreign_keys = [
+                doc.key for doc in store.all(SourceType.VK)
+                if group_name and doc.source_id != str(gid)
+                and str(doc.metadata.get("group_screen_name") or "").casefold() == group_name
+            ]
+            if foreign_keys:
+                # Ранее чужой ID мог сдвинуть курсор за пределы записей этого сообщества.
+                # Повторный обход восполнит возможные пропуски. Удаляем только записи,
+                # помеченные при сохранении именно как записи запрошенного сообщества.
+                store.remove(foreign_keys)
+                state = {}
+                result.notes.append(f"Удалено чужих записей, ранее полученных от API: {len(foreign_keys)}")
             last_max_id = int(state.get("last_max_post_id", 0))
             if group.get("is_closed") and group.get("is_closed") != 0:
                 result.notes.append("сообщество закрытое — доступны только записи, видимые владельцу токена")
 
             changed: list[ParsedDocument] = []
-            offset, fetched, max_id, total = 0, 0, last_max_id, None
+            resume_after = state.get("resume_after_id")
+            max_id = int(state.get("pending_high", last_max_id))
+            offset, fetched, total = 0, 0, None
+            complete = False
+            last_processed_id = resume_after
             try:
                 while fetched < max_posts:
                     count = min(100, max_posts - fetched)
-                    page = await self.call(client, "wall.get", owner_id=owner_id, offset=offset, count=count,
+                    page = await self.call(client, "wall.get", owner_id=owner_id, domain=group.get("screen_name"),
+                                           offset=offset, count=count,
                                            filter="all")
                     total = page.get("count", 0)
                     items = page.get("items", [])
                     if not items:
+                        complete = True
                         break
                     reached_known = False
                     for post in items:
-                        max_id = max(max_id, int(post["id"]))
-                        known = last_max_id and post["id"] <= last_max_id and not post.get("is_pinned")
+                        if post.get("owner_id") != owner_id:
+                            result.skipped += 1
+                            continue
+                        pid = int(post["id"])
+                        pinned = bool(post.get("is_pinned"))
+                        if resume_after is not None and (pinned or pid >= resume_after):
+                            continue
+                        known = last_max_id and pid <= last_max_id and not pinned
                         # известные посты обновляем только в пределах окна refresh_recent (показатели)
                         if known and fetched >= refresh_recent:
                             reached_known = True
                             break
-                        fetched += 1
+                        max_id = max(max_id, pid)
+                        if not pinned:
+                            fetched += 1
+                            last_processed_id = pid
                         doc = post_to_document(post, group)
                         if doc is None:
                             result.skipped += 1
-                            continue
-                        status = store.upsert(doc)
-                        result.count(status)
-                        if status in (UpsertStatus.NEW, UpsertStatus.UPDATED):
-                            changed.append(doc)
+                        else:
+                            status = store.upsert(doc)
+                            result.count(status)
+                            if status in (UpsertStatus.NEW, UpsertStatus.UPDATED):
+                                changed.append(doc)
+                        if known and fetched >= min(refresh_recent, max_posts):
+                            reached_known = True
+                            break
                     offset += len(items)
                     if reached_known or offset >= total:
+                        complete = True
                         break
             except VKRateLimitError as e:
                 result.errors.append(f"{e} — синхронизация остановлена, продолжится со следующего запуска")
 
+            pending = {}
+            if not complete and last_processed_id is not None:
+                pending = {"resume_after_id": last_processed_id, "pending_high": max_id}
             store.set_state(state_key, {
                 "ref": ref, "name": group.get("name"), "screen_name": group.get("screen_name"),
                 "members_count": group.get("members_count"), "description": group.get("description"),
                 "site": group.get("site"), "activity": group.get("activity"), "status": group.get("status"),
-                "wall_total": total, "last_max_post_id": max_id, "last_sync": utcnow().isoformat(),
+                "wall_total": total, "last_max_post_id": max_id if complete else last_max_id,
+                "last_sync": utcnow().isoformat(), **pending,
             })
             result.notes.append(f"сообщество «{group.get('name')}» (id {gid}), подписчиков: "
                                 f"{group.get('members_count')}, записей на стене: {total}, обработано: {fetched}")

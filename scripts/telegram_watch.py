@@ -74,13 +74,18 @@ async def watch(channel: str, company: str, interval: int, initial_pages: int, s
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            break  # asyncio.run обрабатывает Ctrl+C на Windows
     log.info("Старт: канал %s, интервал %s с, хранилище %s, компания %s", channel, interval, store, company)
     while not stop.is_set():
         try:
             res = await runner(channel, company, initial_pages)
             if res.errors:
                 log.error("Проход с ошибкой (позиция сохранена, повтор через %s с): %s", interval, res.errors[0])
+                if once:
+                    return 1
             else:
                 log.info("Проход: новых %d, обновлено %d, показатели %d. %s", res.new, res.updated,
                          res.metrics_updated, " | ".join(res.notes))
@@ -89,6 +94,8 @@ async def watch(channel: str, company: str, interval: int, initial_pages: int, s
             return 2
         except Exception as e:  # noqa: BLE001 — любой сбой одного прохода не останавливает опрос
             log.exception("Проход прерван: %s: %s (позиция сохранена, повтор через %s с)", type(e).__name__, e, interval)
+            if once:
+                return 1
         if once:
             break
         try:
@@ -117,7 +124,10 @@ def main() -> int:
         log.error("%s — ссылка-приглашение закрытого канала: веб-страницы t.me/s/ с постами у него нет. "
                   "Укажите открытый канал или используйте импорт экспорта Telegram Desktop.", a.channel)
         return 2
-    return asyncio.run(watch(value, a.company, max(10, a.interval), s.tg_web_initial_pages, a.store, a.once))
+    try:
+        return asyncio.run(watch(value, a.company, max(10, a.interval), s.tg_web_initial_pages, a.store, a.once))
+    except KeyboardInterrupt:
+        return 0
 
 
 if __name__ == "__main__":

@@ -1,13 +1,19 @@
 # Фронтенд: Telegram Mini App (Vue 3) — контракт с backend
 
-Полная схема: [`docs/openapi.json`](openapi.json) (обновить: `make openapi`), интерактивно — `http://127.0.0.1:8000/docs`.
+Фронтенд Vue 3 предстоит реализовать. Полная схема доступна в [`docs/openapi.json`](openapi.json)
+и по адресу `http://127.0.0.1:8000/docs` после запуска API. Обновление схемы:
+`python -m scripts.manage export-openapi docs/openapi.json`.
 Типы для TypeScript: `npx openapi-typescript docs/openapi.json -o src/api/schema.d.ts`.
 
 ## Разработка без Telegram и без ChatGPT
 
-```bash
-make db && make migrate
-make dev-mock          # API на :8000: ТЕСТОВАЯ модель (AI_PROVIDER=mock_dev) и вход без initData под Telegram ID 1 (админ)
+```powershell
+docker compose up -d db
+python -m scripts.manage init-db
+$env:AI_PROVIDER = "mock_dev"
+$env:API_DEV_USER_ID = "1"
+$env:ADMIN_TELEGRAM_IDS = "1"
+python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
 ```
 
 * Запросы **без** заголовка `Authorization` авторизуются как `API_DEV_USER_ID` — только локально.
@@ -70,6 +76,8 @@ make dev-mock          # API на :8000: ТЕСТОВАЯ модель (AI_PROVI
 **База знаний.** `GET/POST/DELETE /sources` (`{type, ref, is_competitor, sync_now}`), `POST /sources/{id}/sync`
 (202, затем опрашивайте `GET /sources`: `status` syncing → ok | error, `last_result`). Документы:
 `POST /files` (multipart `file`), `GET /files`, `DELETE /files/{name}`. Поиск: `POST /knowledge/search {query, scope}`.
+Источник `telegram_bot` подключает администратор платформы по числовому ID канала вида `-1001234567890`.
+Новые публикации поступают через основной бот, отдельный вызов синхронизации для этого источника не нужен.
 
 **Посты.** Жизненный цикл:
 ```
@@ -83,10 +91,14 @@ draft → pending_approval → approved → scheduled → publishing → publish
 * Правка: `PATCH /posts/{id} {text?, platform?, proposed_at?, target_chat_id?}` — правка согласованного поста возвращает его в draft.
 * Картинка из шаблона: `POST /posts/{id}/image {title, subtitle, template, background}`; медиатека: `GET/POST /media`.
 * Проверка: `POST /posts/{id}/check` → `{ok, errors[], warnings[]}` (errors блокируют отправку).
-* Согласование: `submit {proposed_at?}` → `approve {scheduled_at?, publish_now?}` | `request-changes {comment, auto_revise}` |
+* Согласование: `submit {proposed_at?}` → `approve {review_token, scheduled_at?, publish_now?}` | `request-changes {comment, auto_revise}` |
   `reject {comment}`; `schedule {at}`. Другая площадка: `POST /posts/{id}/adapt?platform=vk`.
+  Покажите в карточке полный материал, `target_chat_id` и `proposed_at`. Передайте `review_token` из показанной
+  версии при согласовании. Устаревший токен даёт 409. Обновите карточку и попросите согласовать заново.
+  Для выбора другого канала сначала обновите черновик и снова отправьте на согласование.
 * Показатели опубликованного: `GET /posts/{id}/analytics`.
-* `content_approved` — согласован ли текущий вариант; `checks` — результат проверки; `last_error` — причина ошибки.
+* `content_approved` показывает действительность согласования, `checks` содержит результат проверки,
+  `last_error` содержит причину ошибки. Если результат отправки неизвестен, проверьте канал перед дальнейшими действиями.
 
 **AI-материалы.** `POST /content/strategy|content-plan|video-script|topics` → `{result, ai}`.
 

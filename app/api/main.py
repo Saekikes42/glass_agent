@@ -29,11 +29,11 @@ def create_app(*, sessionmaker=None, connector=None, embedder=None, searcher=Non
 
     def _wire(st: Any) -> None:
         """Достраивает зависимости, которые не переданы явно (orchestrator, notifier, publisher, task_deps)."""
-        from app.services.publisher import LogNotifier, TelegramBotAPI, TelegramNotifier
+        from app.services.notifications import get_notifier
         from app.services.tasks import TaskDeps
 
         if st.notifier is None:
-            st.notifier = TelegramNotifier(TelegramBotAPI(st.bot_token)) if st.bot_token else LogNotifier()
+            st.notifier = get_notifier(telegram_token=st.bot_token)
         if st.publisher is None:
             from app.services.platforms import PublisherHub
             st.publisher = PublisherHub()

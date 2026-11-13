@@ -47,5 +47,18 @@ services:
     command: ["python", "-m", "scripts.bot"]
     ports: []
 
+  vk-bot:
+    <<: *app
+    profiles: ["vk"]
+    command: ["python", "-m", "scripts.vk_bot"]
+    ports: []
+
+  max-bot:
+    <<: *app
+    profiles: ["max"]
+    command: ["python", "-m", "scripts.max_bot", "--host", "0.0.0.0"]
+    ports:
+      - "127.0.0.1:8011:8011"
+
 volumes:
   glass_pgdata:

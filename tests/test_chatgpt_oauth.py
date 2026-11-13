@@ -2,6 +2,7 @@
 import asyncio
 import os
 import stat
+import subprocess
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 
@@ -9,6 +10,7 @@ import httpx
 import pytest
 from cryptography.fernet import Fernet
 
+from app.ai.auth.flow import finish_login
 from app.ai.auth.oauth import (
     DYNAMIC_CLIENT_ID, REQUIRED_SCOPE, AuthAttempt, ConsentDeclined, OAuthError, RegistrationIncomplete,
     build_authorization_url, load_or_create_host_id, make_pkce, parse_callback,
@@ -55,13 +57,30 @@ def test_callback_parsing():
         parse_callback(f"code=c&state={a.state}", a)
     r = parse_callback(f"code=c&state={a.state}&client_id=oaiapp_9&scope=openid+chatgpt.tokens.use.direct", a)
     assert r.client_id == "oaiapp_9" and r.code == "c"
+    returning = AuthAttempt(client_id="oaiapp_9", redirect_uri=a.redirect_uri)
+    assert parse_callback(f"code=c&state={returning.state}", returning).client_id == "oaiapp_9"
+    with pytest.raises(OAuthError, match="client_id"):
+        parse_callback(f"code=c&state={returning.state}&client_id=oaiapp_OTHER", returning)
+
+
+def assert_private(path):
+    if os.name == "nt":
+        from pathlib import Path
+
+        system32 = Path(os.environ["SystemRoot"]) / "System32"
+        user = subprocess.check_output([str(system32 / "whoami.exe")]).strip().lower()
+        output = subprocess.check_output([str(system32 / "icacls.exe"), str(path)])
+        entries = [line for line in output.lower().splitlines() if b":(" in line]
+        assert len(entries) == 1 and entries[0].rstrip().endswith(user + b":(f)")
+    else:
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
 
 
 def test_host_id_stable(tmp_path):
     p = tmp_path / "host"
     a = load_or_create_host_id(p)
     assert a.startswith("urn:uuid:") and load_or_create_host_id(p) == a
-    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+    assert_private(p)
 
 
 def test_storage_encrypted_0600(tmp_path):
@@ -69,7 +88,7 @@ def test_storage_encrypted_0600(tmp_path):
     st.save(creds(access_token="SECRET_ACCESS"))
     raw = (tmp_path / "c.enc").read_bytes()
     assert b"SECRET_ACCESS" not in raw and b"RT1" not in raw
-    assert stat.S_IMODE(os.stat(tmp_path / "c.enc").st_mode) == 0o600
+    assert_private(tmp_path / "c.enc")
     assert st.load().access_token == "SECRET_ACCESS"
     assert "access_token" not in str(st.load().public_view())
 
@@ -114,3 +133,52 @@ async def test_refresh_invalid_grant_requires_reauth(tmp_path):
     with pytest.raises(AIConnectionUnavailable) as e:
         await tm.get_credentials()
     assert e.value.reason == "reauth_required" and st.load() is None
+
+
+async def test_refresh_scope_revoked_and_rotated_token_saved(tmp_path):
+    st, tm = _manager(tmp_path, lambda r: httpx.Response(200, json={
+        "access_token": "AT2", "refresh_token": "RT2", "scope": "openid email",
+    }))
+    st.save(creds())
+    with pytest.raises(AIConnectionUnavailable) as error:
+        await tm.get_credentials(force_refresh=True)
+    assert error.value.reason == "scope_missing"
+    assert st.load().refresh_token == "RT2"
+
+
+async def test_login_requires_id_token_and_ignores_callback_scope(tmp_path, monkeypatch):
+    st, tm = _manager(tmp_path, lambda r: httpx.Response(500))
+    attempt = AuthAttempt(client_id=DYNAMIC_CLIENT_ID, redirect_uri="http://127.0.0.1:1/auth/callback")
+    callback = parse_callback(f"code=c&state={attempt.state}&client_id=oaiapp_9&scope={REQUIRED_SCOPE}", attempt)
+    body = {"access_token": "AT1"}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=body))) as client:
+        with pytest.raises(OAuthError, match="id_token"):
+            await finish_login(callback, attempt, "urn:uuid:host", tm, client)
+        assert st.load() is None
+
+        async def validate(*args, **kwargs):
+            return {"sub": "verified-user"}
+
+        monkeypatch.setattr("app.ai.auth.flow.validate_id_token", validate)
+        body["id_token"] = "mock-validated"
+        credentials = await finish_login(callback, attempt, "urn:uuid:host", tm, client)
+    assert credentials.subject == "verified-user"
+    assert REQUIRED_SCOPE not in credentials.scopes
+
+
+async def test_file_lock_waiter_can_be_cancelled(tmp_path):
+    st, owner = _manager(tmp_path, lambda r: httpx.Response(500))
+    other = TokenManager(st)
+
+    async def acquire():
+        async with other.locked():
+            return True
+
+    async with owner.locked():
+        waiter = asyncio.create_task(acquire())
+        await asyncio.sleep(0.1)
+        assert not waiter.done()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+    assert await asyncio.wait_for(acquire(), timeout=1)

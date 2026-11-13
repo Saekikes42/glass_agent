@@ -12,6 +12,7 @@ import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
@@ -47,6 +48,7 @@ PAGINATION_PARAM = re.compile(r"^(PAGEN_\d+|page|p|PAGE)$", re.I)
 
 PHONE_RE = re.compile(r"(?<!\d)(?:\+7|8)[\s\- ]*\(?\d{3,4}\)?[\s\- ]*\d{1,3}[\s\- ]*\d{2}[\s\- ]*\d{2}(?!\d)")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+PUBLICATION_DATE_RE = re.compile(r"Дата публикации\s*:\s*(\d{2}\.\d{2}\.\d{4})", re.I)
 
 # Тип страницы по первому сегменту пути. Расширяется под конкретный сайт.
 PAGE_TYPE_BY_SEGMENT = {
@@ -159,6 +161,24 @@ def extract_page(html: str, url: str) -> dict[str, Any]:
     h1 = clean_text(soup.find("h1").get_text(" ")) if soup.find("h1") else ""
     canonical_tag = soup.find("link", rel="canonical")
     canonical = urljoin(url, canonical_tag["href"]) if canonical_tag and canonical_tag.get("href") else ""
+    published_at = None
+    date_tag = soup.select_one('time[itemprop="datePublished"][datetime]')
+    date_value = meta("article:published_time", "datePublished") or (date_tag["datetime"] if date_tag else "")
+    if date_value:
+        try:
+            published_at = datetime.fromisoformat(date_value.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    if published_at is None and classify_page(url) in {"news", "article"}:
+        if date_match := PUBLICATION_DATE_RE.search(soup.get_text(" ", strip=True)):
+            try:
+                published_at = datetime.strptime(date_match.group(1), "%d.%m.%Y")
+            except ValueError:
+                pass
+    if published_at is not None:
+        if published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=timezone.utc)
+        published_at = published_at.astimezone(timezone.utc)
 
     links: list[str] = []
     phones: set[str] = set()
@@ -205,6 +225,7 @@ def extract_page(html: str, url: str) -> dict[str, Any]:
         "site_name": meta("og:site_name"),
         "canonical": canonical,
         "text": text,
+        "published_at": published_at,
         "tables": tables,
         "breadcrumbs": breadcrumbs,
         "phones": sorted(p for p in phones if len(re.sub(r"\D", "", p)) >= 10),
@@ -395,6 +416,7 @@ class WebsiteParser:
             url=final_url,
             title=page["title"],
             text=page["text"],
+            published_at=page["published_at"],
             metadata={
                 "page_type": classify_page(final_url),
                 "description": page["description"],

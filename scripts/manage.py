@@ -4,6 +4,7 @@
     python -m scripts.manage create-company "Салаватстекло" --slug salavatsteklo
     python -m scripts.manage add-source salavatsteklo website https://salstek.ru/
     python -m scripts.manage sync salavatsteklo            # все источники компании
+    python -m scripts.manage import-jsonl salavatsteklo    # data/salavatsteklo → PostgreSQL + RAG
     python -m scripts.manage search salavatsteklo "энергосберегающее стекло для фасада"
     python -m scripts.manage list
     python -m scripts.manage add-member salavatsteklo 123456789 owner
@@ -22,14 +23,16 @@ import asyncio
 import json
 import sys
 import time
+from pathlib import Path
 
 from sqlalchemy import func, select
 
-from app.db.models import Chunk, Company, Source
+from app.core.config import get_settings
+from app.db.models import Chunk, Company, Document, Source
 from app.db.session import get_sessionmaker, init_db
 from app.rag.embeddings import get_embedder
 from app.rag.index import HybridSearcher
-from app.services.sources import add_source, create_company, sync_source
+from app.services.sources import add_source, create_company, import_jsonl, sync_source
 
 
 async def _company(session, slug: str) -> Company:
@@ -49,12 +52,34 @@ async def main_async(a) -> int:
         async with sm() as s, s.begin():
             c = await create_company(s, a.name, slug=a.slug)
         print(f"Компания создана: {c.name} slug={c.slug} id={c.id}")
+    elif a.cmd == "link-identity":
+        from sqlalchemy.exc import IntegrityError
+        from app.services.identities import link_identity
+        try:
+            async with sm() as s, s.begin():
+                identity = await link_identity(s, a.platform, a.external_id, a.telegram_id)
+            print(f"Привязан {identity.platform} ID {identity.external_id} к пользователю {identity.user_id}")
+        except (ValueError, IntegrityError) as exc:
+            message = str(exc) if isinstance(exc, ValueError) else "Конфликт привязки аккаунта"
+            print(message, file=sys.stderr)
+            return 1
     elif a.cmd == "add-source":
         async with sm() as s, s.begin():
             c = await _company(s, a.slug)
             src = await add_source(s, c.id, a.type, a.ref, is_competitor=a.competitor,
                                    options=json.loads(a.options) if a.options else None)
         print(f"Источник: {src.type} {src.ref} id={src.id} competitor={src.is_competitor}")
+    elif a.cmd == "import-jsonl":
+        async with sm() as s:
+            c = await _company(s, a.slug)
+        path = a.directory or get_settings().data_dir / c.slug
+        try:
+            totals = await import_jsonl(sm, c.id, path, get_embedder())
+        except (ValueError, RuntimeError) as e:
+            print(f"Импорт прерван: {e}", file=sys.stderr)
+            return 1
+        print(f"Импорт: новых {totals['new']}, обновлено {totals['updated']}, "
+              f"без изменений {totals['unchanged']}, фрагментов RAG {totals['chunks']}")
     elif a.cmd == "sync":
         async with sm() as s:
             c = await _company(s, a.slug)
@@ -74,6 +99,10 @@ async def main_async(a) -> int:
             print(f"[{src.type}] {src.ref}: новых {r.new}, обновлено {r.updated}, показатели {r.metrics_updated}, "
                   f"без изменений {r.unchanged}, дублей {r.duplicates}, ошибок {len(r.errors)} "
                   f"— {time.monotonic() - t0:.1f} с")
+            if r.errors:
+                code = 1
+                for error in r.errors:
+                    print("   •", error)
             for n in r.notes:
                 print("   •", n)
         return code  # 1, если хотя бы один источник не синхронизировался
@@ -87,7 +116,6 @@ async def main_async(a) -> int:
             print(f"{i}. {h.title} [{h.source_type}] rrf={h.score:.4f} sem#{h.semantic_rank} kw#{h.keyword_rank}\n"
                   f"   {h.url}\n   {snippet}…")
     elif a.cmd == "posts":
-        from app.db.models import Document
         async with sm() as s:
             c = await _company(s, a.slug)
             q = (select(Document).join(Source, Source.id == Document.source_id)
@@ -183,8 +211,6 @@ async def main_async(a) -> int:
             c = await _company(s, a.slug)
             print(analytics.report_text(c.name, await analytics.period_report(s, c.id, days=a.days)))
     elif a.cmd == "export-openapi":
-        from pathlib import Path
-
         from app.api.main import create_app
         Path(a.path).write_text(json.dumps(create_app().openapi(), ensure_ascii=False, indent=1))
         print(f"OpenAPI → {a.path}")
@@ -207,12 +233,17 @@ def main() -> int:
     p = sub.add_parser("add-source"); p.add_argument("slug"); p.add_argument("type"); p.add_argument("ref")
     p.add_argument("--competitor", action="store_true"); p.add_argument("--options", help="JSON")
     p = sub.add_parser("sync"); p.add_argument("slug"); p.add_argument("--type")
+    p = sub.add_parser("import-jsonl", help="перенести каталог парсинга в PostgreSQL и построить индекс RAG")
+    p.add_argument("slug"); p.add_argument("--directory", type=Path)
     p = sub.add_parser("search"); p.add_argument("slug"); p.add_argument("query")
     p.add_argument("--limit", type=int, default=5); p.add_argument("--all", action="store_true",
                                                                    help="включая данные конкурентов")
     p = sub.add_parser("posts", help="последние сохранённые посты (от старых к новым)"); p.add_argument("slug")
     p.add_argument("--type", default="telegram_web"); p.add_argument("--limit", type=int, default=20)
     sub.add_parser("list")
+    p = sub.add_parser("link-identity", help="привязать личный аккаунт VK/MAX к существующему пользователю")
+    p.add_argument("platform", choices=["vk", "max"]); p.add_argument("external_id")
+    p.add_argument("--telegram-id", required=True, type=int)
     p = sub.add_parser("add-member"); p.add_argument("slug"); p.add_argument("telegram_id", type=int)
     p.add_argument("role", choices=["owner", "approver", "editor", "viewer"])
     p = sub.add_parser("settings", help="ключ.подключ=значение (JSON или строка); пустое значение удаляет ключ")

@@ -2,7 +2,7 @@
 
 Примеры:
     python -m scripts.parse_sources --company salavatsteklo website https://salstek.ru/
-    python -m scripts.parse_sources --company salavatsteklo telegram https://t.me/+5LuOqWJkZDU0N2Ri
+    python -m scripts.parse_sources --company salavatsteklo telegram https://t.me/+TestOnlyInvite01
     python -m scripts.parse_sources --company salavatsteklo vk salavatsteklo
 
 Результаты: data/<company>/documents.jsonl, state.json, profile_*.json.
@@ -60,7 +60,7 @@ async def run_telegram_bot(args, store: JsonlDocumentStore) -> SyncResult:
     from app.parsers.telegram_parser import TelegramBotChannelReader
 
     s = get_settings()
-    return await TelegramBotChannelReader(s.tg_bot_token).sync(store)
+    return await TelegramBotChannelReader(s.tg_bot_token).sync(store, channel_id=args.channel_id)
 
 
 async def run_telegram_web(args, store: JsonlDocumentStore) -> SyncResult:
@@ -104,7 +104,8 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--join", action="store_true", help="вступить в канал по приглашению, если ещё не участник")
     t.add_argument("--refresh-recent", type=int, default=50, help="обновить показатели последних N постов")
 
-    sub.add_parser("telegram-bot", help="новые посты собственных каналов через Bot API (getUpdates)")
+    tb = sub.add_parser("telegram-bot", help="новые посты через отдельного бота, у которого нет другого poller")
+    tb.add_argument("--channel-id", type=int, required=True, help="ID канала Bot API, например -1001234567890")
 
     tw = sub.add_parser("telegram-web", help="открытый канал через веб-превью t.me/s/ (без ключей)")
     tw.add_argument("channel", help="@username или https://t.me/username")
@@ -123,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # URL Bot API содержит токен
     settings = get_settings()
     store = JsonlDocumentStore(settings.data_dir / args.company)
     runner = {"website": run_website, "telegram": run_telegram, "telegram-bot": run_telegram_bot,

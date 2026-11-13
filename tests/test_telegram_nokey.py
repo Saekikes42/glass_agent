@@ -43,7 +43,7 @@ def test_parse_web_preview_synthetic():
 
 async def test_web_preview_rejects_private_link(tmp_path):
     with pytest.raises(TelegramAccessError):
-        await TelegramWebPreviewParser().sync("https://t.me/+5LuOqWJkZDU0N2Ri", JsonlDocumentStore(tmp_path))
+        await TelegramWebPreviewParser().sync("https://t.me/+TestOnlyInvite01", JsonlDocumentStore(tmp_path))
 
 
 EXPORT = {

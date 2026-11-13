@@ -58,6 +58,12 @@ def test_post_to_document():
     assert d.metadata["hashtags"] == ["стекло"] and d.metadata["attachments"][0]["url"] == "big"
 
 
+def test_post_keeps_missing_metrics_distinct_from_zero():
+    payload = post(5, likes=0)
+    del payload["comments"], payload["reposts"], payload["views"]
+    assert post_to_document(payload, GROUP).metrics == {"likes": 0, "comments": None, "reposts": None, "views": None}
+
+
 async def test_pagination_incremental_and_metrics(tmp_path):
     wall = [post(i) for i in range(250, 0, -1)]  # новые первыми
     handler, log = vk_server(wall)
@@ -76,10 +82,61 @@ async def test_pagination_incremental_and_metrics(tmp_path):
     assert store.get_state("vk:42")["last_max_post_id"] == 252
 
 
+async def test_foreign_wall_item_does_not_advance_cursor_and_legacy_cursor_is_repaired(tmp_path):
+    foreign_post = dict(post(44809), owner_id=-17042072)
+    wall = [post(358), post(357), foreign_post, post(356)]
+    handler, _ = vk_server(wall)
+    parser = mk(handler)
+    store = JsonlDocumentStore(tmp_path)
+    first = await parser.sync("salavatsteklo", store)
+    assert first.new == 3 and first.skipped == 1
+    assert store.get_state("vk:42")["last_max_post_id"] == 358
+    assert store.get("vk:17042072:44809") is None
+
+    store.upsert(post_to_document(foreign_post, GROUP))
+    independent = post_to_document(dict(post(99), owner_id=-17042072), {"screen_name": "other_group"})
+    store.upsert(independent)
+    store.set_state("vk:42", {"last_max_post_id": 44809, "resume_after_id": 44808, "pending_high": 44809})
+    wall.insert(0, post(359))
+    repaired = await parser.sync("salavatsteklo", store, refresh_recent=1)
+    assert repaired.new == 1 and repaired.skipped == 1
+    assert store.get("vk:42:359") is not None
+    assert store.get("vk:17042072:44809") is None and store.get(independent.key) is not None
+    state = store.get_state("vk:42")
+    assert state["last_max_post_id"] == 359 and not ("resume_after_id" in state or "pending_high" in state)
+
+
 async def test_rate_limit_retry(tmp_path):
     handler, log = vk_server([post(1)], errors={"wall.get": [6, 6]})
     res = await mk(handler).sync("x", JsonlDocumentStore(tmp_path))
     assert res.new == 1 and not res.errors
+
+
+async def test_backfill_resumes_across_runs_without_skipping_new_posts(tmp_path):
+    wall = [post(i) for i in range(5, 0, -1)]
+    handler, _ = vk_server(wall)
+    parser = mk(handler)
+    first = await parser.sync("salavatsteklo", JsonlDocumentStore(tmp_path), max_posts=2)
+    state = JsonlDocumentStore(tmp_path).get_state("vk:42")
+    assert first.new == 2 and state["last_max_post_id"] == 0 and state["resume_after_id"] == 4
+
+    wall.insert(0, post(6))
+    for _ in range(3):
+        await parser.sync("salavatsteklo", JsonlDocumentStore(tmp_path), max_posts=2)
+    store = JsonlDocumentStore(tmp_path)
+    assert {doc.external_id for doc in store.all()} == {str(i) for i in range(1, 7)}
+    assert store.get_state("vk:42")["last_max_post_id"] == 6
+
+
+async def test_pinned_post_does_not_exhaust_backfill_budget(tmp_path):
+    handler, _ = vk_server([post(1, pinned=True), post(3), post(2)])
+    parser = mk(handler)
+    await parser.sync("salavatsteklo", JsonlDocumentStore(tmp_path), max_posts=1)
+    store = JsonlDocumentStore(tmp_path)
+    assert {d.external_id for d in store.all()} == {"1", "3"}
+    await parser.sync("salavatsteklo", store, max_posts=1)
+    assert {d.external_id for d in store.all()} == {"1", "2", "3"}
+    assert store.get_state("vk:42")["last_max_post_id"] == 3
 
 
 @pytest.mark.parametrize("code,exc", [(5, VKAuthError), (15, VKAccessError), (30, VKAccessError)])

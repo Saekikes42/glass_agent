@@ -15,7 +15,8 @@ from app.core.config import get_settings
 from app.db.session import get_sessionmaker, init_db
 from app.rag.embeddings import get_embedder
 from app.rag.index import HybridSearcher
-from app.services.publisher import TelegramBotAPI, TelegramNotifier
+from app.services.publisher import TelegramBotAPI
+from app.services.notifications import get_notifier
 from app.services.tasks import TaskDeps
 
 
@@ -23,7 +24,7 @@ async def main_async() -> int:
     s = get_settings()
     await init_db()
     api = TelegramBotAPI(s.tg_bot_token)
-    notifier = TelegramNotifier(api)
+    notifier = get_notifier()
     embedder = get_embedder()
     orch = Orchestrator(get_ai_connector(), HybridSearcher(embedder), max_steps=s.agent_max_steps,
                         max_llm_calls=s.agent_max_llm_calls, max_seconds=s.agent_max_seconds, notifier=notifier)

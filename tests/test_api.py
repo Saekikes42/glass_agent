@@ -184,6 +184,30 @@ async def test_file_upload_search_and_post_flow(client):
     assert stats["posts_by_status"] == {"draft": 1} and stats["knowledge_documents"] == {"file": 1}
 
 
+async def test_approve_api_rejects_stale_review_token(client):
+    cid = await new_company(client, settings={"channels": {"telegram": "@test_channel"}})
+    response = await client.post(f"/api/companies/{cid}/posts", json={"text": "Первая версия"},
+                                 headers=tma(EDITOR))
+    post_url = f"/api/companies/{cid}/posts/{response.json()['id']}"
+    first = (await client.post(post_url + "/submit", headers=tma(EDITOR))).json()
+    assert first["target_chat_id"] == "@test_channel" and first["review_token"]
+    await client.patch(post_url, json={"text": "Вторая версия"}, headers=tma(EDITOR))
+    stale = await client.post(post_url + "/approve", json={"review_token": first["review_token"]},
+                              headers=tma(OWNER))
+    assert stale.status_code == 409
+
+    second = (await client.post(post_url + "/submit", headers=tma(EDITOR))).json()
+    assert second["review_token"] != first["review_token"]
+    changed_target = await client.post(
+        post_url + "/approve", json={"review_token": second["review_token"], "target_chat_id": "@other"},
+        headers=tma(OWNER),
+    )
+    assert changed_target.status_code == 409
+    approved = await client.post(post_url + "/approve", json={"review_token": second["review_token"]},
+                                 headers=tma(OWNER))
+    assert approved.status_code == 200 and approved.json()["target_chat_id"] == "@test_channel"
+
+
 async def test_checks_block_submit(client):
     cid = await new_company(client, settings={"brand": {"banned_words": ["дешёвый"]}})
     pid = (await client.post(f"/api/companies/{cid}/posts", json={"text": "Самый дешёвый триплекс [вставьте цену]"},
@@ -226,9 +250,12 @@ async def test_secrets_never_returned(client):
 
 
 async def test_dev_mock_full_agent_flow(pg, settings_tmp):
-    """Сценарий ТЗ на ТЕСТОВОЙ модели: поручение → черновик с картинкой → согласование."""
+    """Сквозной сценарий ТЗ с явно тестовой моделью и транспортом Telegram."""
+    from app.services.publisher import run_due
+    from .test_publishing import FakeTelegram, make
+
     async with make_client(pg, DevMockConnector()) as c:
-        cid = await new_company(c)
+        cid = await new_company(c, settings={"channels": {"telegram": "@glass_test"}})
         r = await c.post(f"/api/companies/{cid}/chat", json={"message": "Подготовь пост про энергосберегающее стекло"},
                          headers=tma(EDITOR))
         body = r.json()
@@ -239,3 +266,24 @@ async def test_dev_mock_full_agent_flow(pg, settings_tmp):
         assert c.app.state.notifier.approvals  # согласующим ушло сообщение
         status = (await c.get("/api/ai/connection", headers=tma(EDITOR))).json()
         assert status["is_mock"] is True and "ТЕСТОВАЯ" in status["warning"]
+        fake = FakeTelegram()
+        publisher, notifier = make(fake)
+        _, sm = pg
+        assert await run_due(sm, publisher, notifier) == {}
+        response = await c.post(f"/api/companies/{cid}/posts/{post['id']}/approve",
+                                json={"publish_now": True, "review_token": post.get("review_token")},
+                                headers=tma(OWNER))
+        assert response.status_code == 200, response.text
+        assert await run_due(sm, publisher, notifier) == {post["id"]: "published"}
+        assert await run_due(sm, publisher, notifier) == {}
+        assert len(fake.calls) == 1 and fake.calls[0][0] == "sendPhoto"
+        assert notifier.sent
+
+    async with make_client(pg, DevMockConnector()) as restarted:
+        published = (await restarted.get(f"/api/companies/{cid}/posts/{post['id']}",
+                                          headers=tma(OWNER))).json()
+        assert published["status"] == "published" and published["external_message_id"]
+        history = (await restarted.get(f"/api/companies/{cid}/chat/history", headers=tma(OWNER))).json()
+        assert len(history) == 2 and history[-1]["is_mock"]
+        assert (await restarted.get(f"/api/companies/{cid}/chat/history",
+                                     headers=tma(STRANGER))).status_code == 404

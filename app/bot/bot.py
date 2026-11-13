@@ -23,7 +23,7 @@ from app.ai.orchestrator import Orchestrator
 from app.core.config import get_settings
 from app.db.models import Company, CompanyMember, InboxItem, ScheduledTask, User
 from app.services import analytics, inbox as inbox_svc, posts as P
-from app.services.publisher import PublishError, TelegramBotAPI, approval_message
+from app.services.publisher import PublishError, TelegramBotAPI, send_approval_preview
 
 log = logging.getLogger(__name__)
 ROLE_RANK = {"viewer": 0, "editor": 1, "approver": 2, "owner": 3}
@@ -95,6 +95,15 @@ class GlassBot:
     # ------------------------------------------------------------------ обработка
 
     async def handle(self, update: dict[str, Any]) -> None:
+        if channel_post := update.get("channel_post") or update.get("edited_channel_post"):
+            from app.rag.embeddings import get_embedder
+            from app.services.sources import ingest_telegram_channel_post
+
+            if self.orchestrator:
+                embedder = self.orchestrator.searcher.embedder
+            else:
+                embedder = self.task_deps.embedder if self.task_deps else get_embedder()
+            return await ingest_telegram_channel_post(self.sm, channel_post, embedder)
         if "callback_query" in update:
             return await self.on_callback(update["callback_query"])
         msg = update.get("message")
@@ -225,11 +234,17 @@ class GlassBot:
         if cmd == "/addsource":
             if len(parts) < 2 or parts[0] not in SOURCE_TYPES - {"file"}:
                 return await self.send(chat_id, "Формат: /addsource website|telegram_web|telegram|vk <ссылка> [конкурент]")
-            src = await add_source(session, company.id, parts[0], parts[1], user_id=user.id,
-                                   is_competitor=len(parts) > 2 and parts[2].lower().startswith(("конк", "comp")))
+            if parts[0] == "telegram_bot" and not user.is_admin:
+                return await self.send(chat_id, "Канал Bot API подключает администратор платформы.")
+            try:
+                src = await add_source(session, company.id, parts[0], parts[1], user_id=user.id,
+                                       is_competitor=len(parts) > 2 and parts[2].lower().startswith(("конк", "comp")))
+            except ValueError as e:
+                return await self.send(chat_id, str(e))
             await session.commit()
             return await self.send(chat_id, f"Источник добавлен ({src.type}{', конкурент' if src.is_competitor else ''})."
-                                            " /sync — загрузить сейчас (или ночью автоматически).")
+                                   + (" Бот сохранит новые посты канала." if src.type == "telegram_bot"
+                                      else " /sync — загрузить сейчас (или ночью автоматически)."))
         if cmd == "/setchannel":
             if len(parts) != 2 or parts[0] not in ("telegram", "vk", "max", "telegram_discussion"):
                 return await self.send(chat_id, "Формат: /setchannel telegram|vk|max|telegram_discussion <id или @имя>")
@@ -299,7 +314,10 @@ class GlassBot:
             await session.commit()
             return
         try:
-            post = await P.get_post(session, company.id, awaiting["post_id"])
+            post = await P.get_post(session, company.id, awaiting["post_id"], for_update=True)
+            if ROLE_RANK.get(await self._role(session, user, company.id) or "", -1) < ROLE_RANK["approver"]:
+                raise P.PostStateError("Недостаточно прав")
+            P.require_current_review(post, company, awaiting.get("review_token", ""))
             await P.request_changes(session, post, user_id=user.id, comment=text)
             await session.commit()
         except (LookupError, P.PostStateError) as e:
@@ -322,19 +340,24 @@ class GlassBot:
         drafts = await P.list_posts(session, company_id, status=P.DRAFT, limit=5)
         if not posts and not drafts:
             return await self.send(chat_id, "Нет постов на согласовании и черновиков.")
+        company = await session.get(Company, company_id)
         for p in posts:
-            text, kb = approval_message(p)
-            await self.send(chat_id, text, reply_markup=kb)
+            try:
+                await send_approval_preview(self.api, chat_id, p, company)
+            except PublishError as e:
+                await self.send(chat_id, f"Не удалось показать материал на согласование: {e}")
         for p in drafts:
             await self.send(chat_id, f"Черновик · {p.platform} · {p.id}\n\n{p.text[:3500]}", reply_markup={
                 "inline_keyboard": [[{"text": "📨 На согласование", "callback_data": f"sb:{p.id}"}]]})
 
     async def on_callback(self, cq: dict[str, Any]) -> None:
         data, tg = cq.get("data", ""), cq["from"]
-        action, _, oid = data.partition(":")
+        action, _, payload = data.partition(":")
+        oid, _, review_token = payload.partition(":")
         note = "Готово"
         chat_id = (cq.get("message") or {}).get("chat", {}).get("id") or tg["id"]
         followup: str | None = None
+        submitted_post = None
         async with self.sm() as session:
             user = await self._user(session, tg)
             try:
@@ -344,7 +367,7 @@ class GlassBot:
             if action in ("id", "is", "ii"):
                 note = await self._inbox_action(session, user, action, obj_id)
             else:
-                post = await session.get(P.Post, obj_id) if obj_id else None
+                post = await session.get(P.Post, obj_id, with_for_update=True) if obj_id else None
                 need = ROLE_RANK["editor"] if action == "sb" else ROLE_RANK["approver"]
                 if post is None:
                     note = "Пост не найден"
@@ -352,6 +375,9 @@ class GlassBot:
                     note = "Недостаточно прав"
                 else:
                     try:
+                        company = await session.get(Company, post.company_id)
+                        if action in ("ap", "pn", "rv", "rj"):
+                            P.require_current_review(post, company, review_token)
                         if action == "ap":
                             await P.approve(session, post, user_id=user.id, scheduled_at=post.proposed_at)
                             note = ("Согласовано, публикация " + post.proposed_at.astimezone().strftime("%d.%m %H:%M")
@@ -363,7 +389,8 @@ class GlassBot:
                             await P.reject(session, post, user_id=user.id, comment="Отклонено в боте")
                             note = "Отклонено — публикации не будет"
                         elif action == "rv":
-                            self._set_pref(user, awaiting={"kind": "revision", "post_id": str(post.id)},
+                            self._set_pref(user, awaiting={"kind": "revision", "post_id": str(post.id),
+                                                          "review_token": review_token},
                                            company_id=str(post.company_id))
                             note = "Напишите комментарий — что доработать"
                             followup = "✏️ Напишите одним сообщением, что доработать в посте:"
@@ -371,10 +398,19 @@ class GlassBot:
                             await P.submit(session, post, user_id=user.id)
                             note = "Отправлено на согласование"
                         await session.commit()
+                        if action == "sb":
+                            submitted_post = post
                     except P.PostStateError as e:
                         await session.rollback()
                         note = str(e)
         await self.api.call("answerCallbackQuery", {"callback_query_id": cq["id"], "text": note[:190]})
+        notifier = getattr(self.orchestrator, "notifier", None)
+        if submitted_post is not None and hasattr(notifier, "notify_approval"):
+            try:
+                async with self.sm() as session:
+                    await notifier.notify_approval(session, submitted_post)
+            except Exception:  # noqa: BLE001
+                log.exception("Уведомление о согласовании не отправлено")
         if followup:
             await self.send(chat_id, followup)
 
@@ -413,15 +449,19 @@ class GlassBot:
         while not stop.is_set():
             try:
                 updates = await self.api.call("getUpdates", {"offset": self.offset, "timeout": 50,
-                                                             "allowed_updates": ["message", "callback_query"]},
+                                                              "allowed_updates": ["message", "callback_query",
+                                                                                  "channel_post", "edited_channel_post"]},
                                               timeout=60)
             except PublishError as e:
                 log.warning("getUpdates: %s", e)
                 await asyncio.sleep(5)
                 continue
             for u in updates:
-                self.offset = u["update_id"] + 1
                 try:
                     await self.handle(u)
                 except Exception:  # noqa: BLE001
                     log.exception("Ошибка обработки update %s", u.get("update_id"))
+                    if "channel_post" in u or "edited_channel_post" in u:
+                        await asyncio.sleep(5)
+                        break  # Telegram доставит пост повторно, пока транзакция не завершится
+                self.offset = u["update_id"] + 1

@@ -2,19 +2,23 @@
 
     python -m scripts.doctor            # локальные проверки (без запросов к внешним сервисам)
     python -m scripts.doctor --live     # + запросы только на чтение: Telegram getMe/getChat, ChatGPT /models,
-                                        #   VK groups.getById, MAX /me
+                                        #   VK groups.getById/groups.getLongPollServer, MAX /me
+    python -m scripts.doctor --live --vk-publish-company <slug>  # только права публикации VK этой компании
     python -m scripts.doctor --model    # + загрузка модели эмбеддингов
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 from pathlib import Path
 
 from sqlalchemy import func, select, text
 
 OK, WARN, FAIL = "✅", "⚠️ ", "❌"
+VK_SCOPE_PHOTOS = 4
+VK_SCOPE_WALL = 8192
 results: list[tuple[str, str, str, str]] = []
 
 
@@ -81,6 +85,21 @@ def check_fonts() -> None:
         report(OK, "Шрифты", find_font(True))
     except ImageError as e:
         report(FAIL, "Шрифты", str(e), "apt install fonts-dejavu-core или GLASS_FONT=/путь/к/шрифту.ttf")
+
+
+def check_telegram_history() -> None:
+    from app.core.config import get_settings
+
+    s = get_settings()
+    session_path = s.tg_session_path
+    if not str(session_path).endswith(".session"):
+        session_path = Path(f"{session_path}.session")  # Telethon дописывает расширение
+    present = bool(s.tg_api_id), bool(s.tg_api_hash), session_path.is_file()
+    status = ", ".join(f"{name}: {'есть' if available else 'нет'}" for name, available in
+                       zip(("TG_API_ID", "TG_API_HASH", "файл сессии"), present))
+    report(OK if all(present) else WARN, "Telegram история", status,
+           "наличие файла сессии не подтверждает авторизацию и доступ к каналу" if all(present)
+           else "my.telegram.org → API development tools; python -m scripts.telegram_login, либо импорт JSON-экспорта")
 
 
 async def check_ai(live: bool) -> None:
@@ -154,7 +173,7 @@ async def check_vk(live: bool) -> None:
     from app.core.config import get_settings
 
     s = get_settings()
-    if not s.vk_app_id:
+    if not s.vk_app_id and not s.vk_access_token:
         report(WARN, "VK", "VK_APP_ID не задан — ключ по ссылке получить нельзя", "docs/HANDOFF.md, раздел VK")
     report(OK if s.vk_access_token else WARN, "VK чтение", "VK_ACCESS_TOKEN задан" if s.vk_access_token
            else "нет ключа — парсер VK и сбор комментариев не работают", "" if s.vk_access_token
@@ -170,17 +189,122 @@ async def check_vk(live: bool) -> None:
             async with httpx.AsyncClient(timeout=20) as client:
                 g = await VKParser(s.vk_access_token, api_base=s.vk_api_base).get_group(client, "salavatsteklo")
             report(OK, "VK API", f"доступ есть: {g.get('name')}")
-        except VKError as e:
-            report(FAIL, "VK API", str(e), "получить новый ключ: python -m scripts.vk_token")
+        except (VKError, ValueError, KeyError, TypeError) as e:
+            report(FAIL, "VK API", f"не удалось прочитать сообщество ({type(e).__name__})",
+                   "проверить ключ: python -m scripts.vk_token")
+
+    group_ok = bool(s.vk_bot_group_id and s.vk_bot_group_id > 0)
+    bot_ok = bool(s.vk_bot_token) and group_ok
+    if bot_ok:
+        fix = "" if live else "проверка Long Poll: --live"
+    else:
+        fix = "указать ключ сообщества для сообщений и ID, включить Bots Long Poll"
+    report(OK if bot_ok else WARN, "VK бот",
+           f"VK_BOT_TOKEN: {'задан' if s.vk_bot_token else 'нет'}, "
+           f"VK_BOT_GROUP_ID: {'задан' if group_ok else 'нет положительного ID'}", fix)
+    if live and bot_ok:
+        from app.bot.vk_bot import VKMessenger
+        from app.services.publisher import PublishError
+
+        messenger = VKMessenger(s.vk_bot_token, api_base=s.vk_api_base, api_version=s.vk_api_version)
+        try:
+            info = await messenger.call("groups.getLongPollServer", group_id=s.vk_bot_group_id)
+        except PublishError as e:
+            report(FAIL, "VK Long Poll", str(e), "проверить права ключа на сообщения и настройки Long Poll сообщества")
+        else:
+            ready = isinstance(info, dict) and all(info.get(field) for field in ("server", "key", "ts"))
+            report(OK if ready else FAIL, "VK Long Poll",
+                   "параметры подключения получены" if ready else "API вернул неполные параметры подключения")
+
+
+async def check_vk_publish(company_slug: str) -> None:
+    import httpx
+
+    from app.core.config import get_settings
+    from app.db.models import Company, CompanySecret
+    from app.db.session import get_sessionmaker
+    from app.parsers.vk_parser import VKError, VKParser, parse_group_ref
+    from app.services.secrets import get_secret
+
+    area = f"VK публикация {company_slug}"
+    try:
+        settings = get_settings()
+        async with get_sessionmaker()() as session:
+            company = await session.scalar(select(Company).where(Company.slug == company_slug))
+            if company is None:
+                report(FAIL, area, "компания не найдена")
+                return
+            target = ((company.settings or {}).get("channels") or {}).get("vk")
+            ref = parse_group_ref(str(target)) if target else ""
+            if not re.fullmatch(r"[\w.]+", ref):
+                report(FAIL, area, "укажите сообщество в settings.channels.vk")
+                return
+            if settings.glass_secret_key or settings.master_key_path.is_file():
+                company_token = await get_secret(session, company.id, "vk_token")
+            else:
+                # get_secret может создать новый файл ключа. Диагностика его не создаёт.
+                if await session.get(CompanySecret, (company.id, "vk_token")) is not None:
+                    report(FAIL, area, "нет ключа шифрования для секрета компании vk_token")
+                    return
+                company_token = None
+    except Exception:  # ошибки БД и расшифровки могут содержать данные конфигурации
+        report(FAIL, area, "не удалось прочитать настройки или секрет компании",
+               "проверьте DATABASE_URL и ключ шифрования секретов")
+        return
+
+    token = company_token or settings.vk_publish_token
+    if not token:
+        report(FAIL, area, "нет пользовательского токена VK для публикации",
+               "задайте секрет компании vk_token или VK_PUBLISH_TOKEN")
+        return
+
+    api = VKParser(token, api_base=settings.vk_api_base, api_version=settings.vk_api_version, max_retries=0)
+    method = "account.getAppPermissions"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            scope = await api.call(client, method)
+            if type(scope) is not int or scope < 0:
+                raise ValueError("invalid permissions bitmask")
+            photos = bool(scope & VK_SCOPE_PHOTOS)
+            report(OK if photos else WARN, area, f"право photos {'есть' if photos else 'отсутствует'}")
+            if not scope & VK_SCOPE_WALL:
+                report(FAIL, area, "у токена нет обязательного права wall")
+                return
+
+            method = "groups.getById"
+            response = await api.call(client, method, group_id=ref, fields="can_post,admin_level")
+            groups = response.get("groups") if isinstance(response, dict) else response
+            if not isinstance(groups, list) or len(groups) != 1 or not isinstance(groups[0], dict):
+                raise ValueError("invalid group response")
+            group = groups[0]
+            group_id = group.get("id")
+            if type(group_id) is not int or group_id <= 0 or (ref.isdecimal() and group_id != int(ref)):
+                raise ValueError("invalid group ID")
+    except VKError as exc:
+        report(FAIL, area, f"{method} отклонён (код VK {exc.code})",
+               "проверьте пользовательский токен и доступ к сообществу")
+        return
+    except (httpx.HTTPError, AttributeError, KeyError, TypeError, ValueError):
+        report(FAIL, area, f"не удалось получить корректный ответ {method}")
+        return
+
+    if group.get("can_post") != 1 or group.get("admin_level") not in (2, 3):
+        report(FAIL, area, f"для сообщества {group_id} VK не подтвердил право писать от его имени",
+               "проверьте разрешение на публикацию и роль редактора или администратора")
+        return
+    report(OK, area, f"VK подтвердил право wall и доступ к стене сообщества {group_id}. Публикация не проверялась.")
 
 
 async def check_max(live: bool) -> None:
     from app.core.config import get_settings
 
     s = get_settings()
+    report(OK if s.max_webhook_secret else WARN, "MAX вебхук",
+           "MAX_WEBHOOK_SECRET задан" if s.max_webhook_secret else "MAX_WEBHOOK_SECRET не задан",
+           "" if s.max_webhook_secret else "для HTTPS-вебхука задайте локальный секрет в .env")
     if not s.max_bot_token:
-        report(WARN, "MAX", "MAX_BOT_TOKEN не задан — публикация в MAX недоступна",
-               "business.max.ru → Чат-боты → Настройки → токен; или секрет компании max_bot_token")
+        report(WARN, "MAX", "MAX_BOT_TOKEN не задан — личный бот и общий ключ публикации недоступны",
+               "business.max.ru → Чат-боты → Настройки → токен; для публикации можно задать секрет компании max_bot_token")
         return
     if live:
         from app.services.platforms import MaxAPI
@@ -205,6 +329,11 @@ def check_model() -> None:
 
 
 async def main_async(a) -> int:
+    results.clear()
+    if a.vk_publish_company is not None:
+        await check_vk_publish(a.vk_publish_company)
+        return int(any(r[0] == FAIL for r in results))
+
     print("Glass Agent — проверка окружения\n")
     if not Path(".env").exists():
         report(WARN, ".env", "файл не найден", "cp .env.example .env")
@@ -212,6 +341,7 @@ async def main_async(a) -> int:
         await check_companies()
     check_fonts()
     await check_ai(a.live)
+    check_telegram_history()
     await check_telegram(a.live)
     await check_vk(a.live)
     await check_max(a.live)
@@ -228,7 +358,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true", help="запросы на чтение к внешним сервисам")
     ap.add_argument("--model", action="store_true", help="проверить загрузку модели эмбеддингов")
+    ap.add_argument("--vk-publish-company", metavar="SLUG",
+                    help="проверить только права публикации VK указанной компании")
     a = ap.parse_args()
+    if a.vk_publish_company is not None and (not a.live or a.model):
+        ap.error("--vk-publish-company требует --live и используется без --model")
     code = asyncio.run(main_async(a))
     if a.model:
         check_model()

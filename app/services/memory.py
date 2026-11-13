@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.connectors.base import AIConnector, AIError, AIMessage
@@ -38,9 +39,9 @@ async def get_conversation(session: AsyncSession, company_id: uuid.UUID) -> Conv
     if conv is None:
         if await session.get(Company, company_id) is None:
             raise LookupError("Компания не найдена")
-        conv = Conversation(company_id=company_id, state={})
-        session.add(conv)
-        await session.flush()
+        await session.execute(insert(Conversation).values(company_id=company_id, state={})
+                              .on_conflict_do_nothing(index_elements=[Conversation.company_id]))
+        conv = await session.scalar(select(Conversation).where(Conversation.company_id == company_id))
     return conv
 
 

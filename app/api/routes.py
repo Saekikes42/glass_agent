@@ -303,8 +303,11 @@ async def ai_disconnect(request: Request, user: User = Depends(require_admin)):
     disconnect = getattr(request.app.state.connector, "disconnect", None)
     if disconnect is None:
         raise HTTPException(400, "Коннектор не поддерживает отключение")
-    await disconnect()
-    return {"connected": False}
+    revoked = await disconnect()
+    result = {"connected": False, "remote_revocation_confirmed": revoked is True}
+    if revoked is False:
+        result["warning"] = "Локальная сессия удалена. Отзыв на стороне OpenAI не подтверждён."
+    return result
 
 
 # --------------------------------------------------------------------------- чат и память
@@ -399,8 +402,13 @@ async def create_source(body: SourceIn, request: Request, background: Background
     is_competitor=true — данные конкурента (ищутся отдельно)."""
     if body.type not in API_SOURCE_TYPES:
         raise HTTPException(422, f"type должен быть одним из {sorted(API_SOURCE_TYPES)}; файлы — POST .../files")
-    src = await add_source(session, company.id, body.type, body.ref, name=body.name,
-                           is_competitor=body.is_competitor, options=body.options, user_id=user.id)
+    if body.type == "telegram_bot" and not user.is_admin:
+        raise HTTPException(403, "Канал Bot API подключает администратор платформы")
+    try:
+        src = await add_source(session, company.id, body.type, body.ref, name=body.name,
+                               is_competitor=body.is_competitor, options=body.options, user_id=user.id)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
     await session.commit()
     if body.sync_now:
         background.add_task(_sync_bg, request.app, src.id, company.id)
@@ -435,7 +443,9 @@ async def sync_source_ep(source_id: uuid.UUID, request: Request, background: Bac
     src = await session.scalar(select(Source).where(Source.id == source_id, Source.company_id == company.id))
     if src is None:
         raise HTTPException(404, "Источник не найден")
-    if src.status == "syncing":
+    from app.services.sources import source_sync_in_progress
+
+    if source_sync_in_progress(src):
         raise HTTPException(409, "Синхронизация уже выполняется")
     background.add_task(_sync_bg, request.app, src.id, company.id)
     return {"source_id": str(src.id), "status": "started"}
@@ -559,7 +569,7 @@ async def generate_post(body: GenerateIn, request: Request, company: Company = D
     await session.commit()
     if post.status == P.PENDING:
         await _notify_approval(request, session, post)
-    return P.post_to_dict(post)
+    return P.post_to_dict(post, company)
 
 
 class ContentIn(BaseModel):
@@ -608,6 +618,7 @@ class ApproveIn(BaseModel):
     scheduled_at: datetime | None = None  # пусто: proposed_at поста, если есть; иначе только согласовать
     publish_now: bool = False
     target_chat_id: str | None = None
+    review_token: str | None = Field(default=None, pattern=r"^[a-f0-9]{24}$")
 
 
 class CommentIn(BaseModel):
@@ -659,19 +670,19 @@ async def create_post(body: PostIn, company: Company = Depends(access("editor"))
     post = await P.create_draft(session, company.id, text=body.text, topic=body.topic, platform=body.platform,
                                 user_id=user.id, generated_by={"provider": "human"}, proposed_at=body.proposed_at)
     await session.commit()
-    return P.post_to_dict(post)
+    return P.post_to_dict(post, company)
 
 
 @router.get("/companies/{company_id}/posts", response_model=list[S.PostOut], tags=["posts"])
 async def list_posts(status: str | None = None, company: Company = Depends(access("viewer")),
                      session: AsyncSession = Depends(get_session)):
-    return [P.post_to_dict(p) for p in await P.list_posts(session, company.id, status=status, limit=100)]
+    return [P.post_to_dict(p, company) for p in await P.list_posts(session, company.id, status=status, limit=100)]
 
 
 @router.get("/companies/{company_id}/posts/{post_id}", response_model=S.PostOut, tags=["posts"])
 async def get_post(post_id: uuid.UUID, company: Company = Depends(access("viewer")),
                    session: AsyncSession = Depends(get_session)):
-    return P.post_to_dict(await _post(session, company, post_id))
+    return P.post_to_dict(await _post(session, company, post_id), company)
 
 
 @router.get("/companies/{company_id}/posts/{post_id}/image", tags=["posts"])
@@ -689,18 +700,13 @@ async def patch_post(post_id: uuid.UUID, body: PostPatch, company: Company = Dep
     """Правка текста/площадки/канала. Изменение согласованного поста возвращает его в черновик."""
     post = await _post(session, company, post_id, for_update=True)
     try:
-        if body.text is not None or body.platform is not None:
-            await P.edit_content(session, post, text=body.text, platform=body.platform, user_id=user.id)
-        if body.target_chat_id is not None:
-            if post.status in (P.APPROVED, P.SCHEDULED):
-                raise P.PostStateError("Канал согласованного поста менять нельзя — верните в черновик")
-            post.target_chat_id = body.target_chat_id or None
+        if body.model_fields_set:
+            await P.edit_content(session, post, text=body.text, platform=body.platform,
+                                 target_chat_id=body.target_chat_id, proposed_at=body.proposed_at, user_id=user.id)
     except P.PostStateError as e:
         raise _state_error(e) from e
-    if body.proposed_at is not None:
-        post.proposed_at = body.proposed_at
     await session.commit()
-    return P.post_to_dict(post)
+    return P.post_to_dict(post, company)
 
 
 @router.post("/companies/{company_id}/posts/{post_id}/image", response_model=S.PostOut, tags=["posts"])
@@ -718,7 +724,7 @@ async def post_image(post_id: uuid.UUID, body: ImageIn, company: Company = Depen
     except P.PostStateError as e:
         raise _state_error(e) from e
     await session.commit()
-    return P.post_to_dict(post)
+    return P.post_to_dict(post, company)
 
 
 @router.post("/companies/{company_id}/posts/{post_id}/check", tags=["posts"])
@@ -744,7 +750,7 @@ async def submit_post(post_id: uuid.UUID, request: Request, body: SubmitIn | Non
         raise _state_error(e) from e
     await session.commit()
     await _notify_approval(request, session, post)
-    return P.post_to_dict(post)
+    return P.post_to_dict(post, company)
 
 
 @router.post("/companies/{company_id}/posts/{post_id}/approve", response_model=S.PostOut, tags=["posts"])
@@ -754,11 +760,12 @@ async def approve_post(post_id: uuid.UUID, body: ApproveIn | None = None, compan
     post = await _post(session, company, post_id, for_update=True)
     at = datetime.now(timezone.utc) if body.publish_now else (body.scheduled_at or post.proposed_at)
     try:
-        await P.approve(session, post, user_id=user.id, scheduled_at=at, target_chat_id=body.target_chat_id)
+        await P.approve(session, post, user_id=user.id, scheduled_at=at, target_chat_id=body.target_chat_id,
+                        expected_review=body.review_token)
     except P.PostStateError as e:
         raise _state_error(e) from e
     await session.commit()
-    return P.post_to_dict(post)
+    return P.post_to_dict(post, company)
 
 
 @router.post("/companies/{company_id}/posts/{post_id}/request-changes", response_model=S.PostOut, responses=AI_ERR,
@@ -786,7 +793,7 @@ async def request_changes(post_id: uuid.UUID, body: ChangesIn, request: Request,
         except (ToolError, P.PostStateError) as e:
             await session.rollback()
             raise HTTPException(409, str(e)) from e
-    return P.post_to_dict(post)
+    return P.post_to_dict(post, company)
 
 
 @router.post("/companies/{company_id}/posts/{post_id}/reject", response_model=S.PostOut, tags=["posts"])
@@ -798,7 +805,7 @@ async def reject_post(post_id: uuid.UUID, body: CommentIn, company: Company = De
     except P.PostStateError as e:
         raise _state_error(e) from e
     await session.commit()
-    return P.post_to_dict(post)
+    return P.post_to_dict(post, company)
 
 
 @router.post("/companies/{company_id}/posts/{post_id}/schedule", response_model=S.PostOut, tags=["posts"])
@@ -810,7 +817,7 @@ async def schedule_post(post_id: uuid.UUID, body: ScheduleIn, company: Company =
     except P.PostStateError as e:
         raise _state_error(e) from e
     await session.commit()
-    return P.post_to_dict(post)
+    return P.post_to_dict(post, company)
 
 
 @router.post("/companies/{company_id}/posts/{post_id}/adapt", responses=AI_ERR, tags=["posts"])

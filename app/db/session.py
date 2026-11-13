@@ -66,5 +66,7 @@ async def init_db(engine: AsyncEngine | None = None) -> None:
     """Расширение pgvector и миграции до последней ревизии."""
     engine = engine or get_engine()
     async with engine.begin() as conn:
+        # API, bot and scheduler can start together against an empty database.
+        await conn.execute(text("SELECT pg_advisory_xact_lock(713025481)"))
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(_migrate)

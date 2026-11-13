@@ -28,6 +28,7 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection) -> None:
+    connection.execute(text("SELECT pg_advisory_xact_lock(713025481)"))
     connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     context.configure(connection=connection, target_metadata=target_metadata, compare_type=True,
                       include_object=_include)

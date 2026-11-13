@@ -16,7 +16,7 @@ from typing import Any
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import AuditLog, Post
+from app.db.models import AuditLog, Company, Post
 
 from . import memory as mem
 
@@ -57,8 +57,42 @@ def content_digest(post: Post) -> str:
     return h.hexdigest()
 
 
+def target_for(post: Post, company: Company) -> str | None:
+    if post.target_chat_id:
+        return post.target_chat_id
+    settings = company.settings or {}
+    target = (settings.get("channels") or {}).get(post.platform)
+    if not target and post.platform == "telegram":
+        target = settings.get("telegram_channel")
+    return str(target) if target else None
+
+
+def _approval_digest(post: Post, target: str | None) -> str:
+    values = (content_digest(post), str(post.revision), target or "")
+    return hashlib.sha256("\0".join(values).encode()).hexdigest()
+
+
+def review_token(post: Post, company: Company) -> str:
+    proposed = _aware(post.proposed_at)
+    values = (_approval_digest(post, target_for(post, company)),
+              proposed.astimezone(timezone.utc).isoformat() if proposed else "",
+              (post.meta or {}).get("review_id", ""))
+    return hashlib.sha256("\0".join(values).encode()).hexdigest()[:24]
+
+
+def require_current_review(post: Post, company: Company, token: str) -> None:
+    if post.status != PENDING or token != review_token(post, company):
+        raise PostStateError("Материал изменился. Откройте актуальный пост на согласование.")
+
+
 def is_approved_content(post: Post) -> bool:
-    return bool(post.approved_hash) and post.approved_hash == content_digest(post)
+    meta = post.meta or {}
+    if "approval_target" not in meta or not post.approved_hash:
+        return False
+    target = meta["approval_target"]
+    if post.status != PUBLISHED and post.target_chat_id and post.target_chat_id != target:
+        return False
+    return post.approved_hash == _approval_digest(post, target)
 
 
 def _now() -> datetime:
@@ -123,11 +157,14 @@ async def create_draft(session: AsyncSession, company_id: uuid.UUID, *, text: st
 
 async def edit_content(session: AsyncSession, post: Post, *, text: str | None = None,
                        image_path: str | None = None, image_meta: dict[str, Any] | None = None,
-                       platform: str | None = None, user_id: int | None = None) -> Post:
+                       platform: str | None = None, target_chat_id: str | None = None,
+                       proposed_at: datetime | None = None, user_id: int | None = None) -> Post:
     """Изменение контента. Если пост был согласован/запланирован — согласование сбрасывается."""
     if post.status not in EDITABLE:
         raise PostStateError(f"Пост в статусе {post.status} изменять нельзя")
-    before = content_digest(post)
+    if (post.meta or {}).get("publish_uncertain") or (post.meta or {}).get("telegram_photo_id"):
+        raise PostStateError("Сначала проверьте результат отправки в канале")
+    before = (content_digest(post), post.target_chat_id, post.proposed_at)
     if text is not None:
         post.text = text.strip()
     if image_path is not None:
@@ -136,8 +173,14 @@ async def edit_content(session: AsyncSession, post: Post, *, text: str | None = 
     if platform is not None:
         if platform not in PLATFORMS:
             raise PostStateError(f"Площадка {platform} не поддерживается")
+        if post.platform != platform:
+            post.target_chat_id = None
         post.platform = platform
-    if content_digest(post) == before:
+    if target_chat_id is not None:
+        post.target_chat_id = target_chat_id or None
+    if proposed_at is not None:
+        post.proposed_at = _aware(proposed_at)
+    if (content_digest(post), post.target_chat_id, post.proposed_at) == before:
         return post
     post.revision += 1
     if post.status != DRAFT:
@@ -146,6 +189,7 @@ async def edit_content(session: AsyncSession, post: Post, *, text: str | None = 
     post.approved_at = None
     post.approved_by_user_id = None
     post.scheduled_at = None
+    post.meta = {k: v for k, v in (post.meta or {}).items() if k != "approval_target"}
     _audit(session, post, "edit", user_id, revision=post.revision)
     await mem.remember(session, post.company_id, f"Пост {post.id} изменён (ревизия {post.revision}), "
                        "требуется повторное согласование", kind="episodic", category="post_updated",
@@ -175,6 +219,7 @@ async def submit(session: AsyncSession, post: Post, *, user_id: int | None = Non
     if proposed_at is not None:
         post.proposed_at = _aware(proposed_at)
     _move(post, PENDING)
+    post.meta = {**(post.meta or {}), "review_id": uuid.uuid4().hex}
     _audit(session, post, "submit", user_id, warnings=result["warnings"])
     return post
 
@@ -193,16 +238,28 @@ async def request_changes(session: AsyncSession, post: Post, *, user_id: int | N
 
 
 async def approve(session: AsyncSession, post: Post, *, user_id: int | None,
-                  scheduled_at: datetime | None = None, target_chat_id: str | None = None) -> Post:
+                  scheduled_at: datetime | None = None, target_chat_id: str | None = None,
+                  expected_review: str | None = None) -> Post:
+    company = await session.get(Company, post.company_id)
+    if expected_review is not None:
+        require_current_review(post, company, expected_review)
+        if target_chat_id and target_chat_id != target_for(post, company):
+            raise PostStateError("Сначала укажите канал в материале на согласование")
     if post.status in (DRAFT, REJECTED, REVISION):
         await submit(session, post, user_id=user_id)  # одобрение из черновика = отправка + согласование
+    elif post.status == PENDING:
+        result = await run_checks(session, post)
+        if not result["ok"]:
+            raise PostStateError("Проверка не пройдена: " + "; ".join(result["errors"]))
     _move(post, APPROVED)
     post.approved_by_user_id = user_id
     post.approved_at = _now()
-    post.approved_hash = content_digest(post)
     post.review_comment = None
     if target_chat_id:
         post.target_chat_id = target_chat_id
+    target = target_for(post, company)
+    post.meta = {**(post.meta or {}), "approval_target": target}
+    post.approved_hash = _approval_digest(post, target)
     _audit(session, post, "approve", user_id)
     await mem.remember(session, post.company_id, f"Пост {post.id} согласован", kind="episodic",
                        category="post_approved", meta={"post_id": str(post.id)})
@@ -222,6 +279,8 @@ async def reject(session: AsyncSession, post: Post, *, user_id: int | None, comm
 
 
 async def schedule(session: AsyncSession, post: Post, at: datetime | None, *, user_id: int | None = None) -> Post:
+    if (post.meta or {}).get("publish_uncertain"):
+        raise PostStateError("Результат предыдущей отправки неизвестен. Проверьте публикацию в канале.")
     if not is_approved_content(post):
         raise PostStateError("Контент не согласован или изменён после согласования")
     at = at or _now()
@@ -235,15 +294,16 @@ async def schedule(session: AsyncSession, post: Post, at: datetime | None, *, us
     return post
 
 
-async def claim_for_publishing(session: AsyncSession, post_id: uuid.UUID) -> bool:
+async def claim_for_publishing(session: AsyncSession, post_id: uuid.UUID, *, due_by: datetime | None = None) -> bool:
     """Атомарно забирает пост в публикацию — защита от двойной отправки параллельными воркерами."""
-    res = await session.execute(update(Post).where(Post.id == post_id, Post.status == SCHEDULED,
-                                                   Post.external_message_id.is_(None))
-                                .values(status=PUBLISHING, publish_attempts=Post.publish_attempts + 1))
+    stmt = update(Post).where(Post.id == post_id, Post.status == SCHEDULED, Post.external_message_id.is_(None))
+    if due_by is not None:
+        stmt = stmt.where(Post.scheduled_at <= due_by)
+    res = await session.execute(stmt.values(status=PUBLISHING, publish_attempts=Post.publish_attempts + 1))
     return res.rowcount == 1
 
 
-def post_to_dict(p: Post) -> dict[str, Any]:
+def post_to_dict(p: Post, company: Company | None = None) -> dict[str, Any]:
     return {
         "id": str(p.id), "status": p.status, "platform": p.platform, "topic": p.topic, "text": p.text,
         "proposed_at": p.proposed_at.isoformat() if p.proposed_at else None,
@@ -254,6 +314,9 @@ def post_to_dict(p: Post) -> dict[str, Any]:
         "image_meta": p.image_meta, "revision": p.revision,
         "generated_by": p.generated_by, "approved_at": p.approved_at.isoformat() if p.approved_at else None,
         "content_approved": is_approved_content(p), "review_comment": p.review_comment,
+        "target_chat_id": ((p.meta or {}).get("approval_target", p.target_chat_id) if p.approved_hash
+                           else target_for(p, company) if company is not None else p.target_chat_id),
+        "review_token": review_token(p, company) if p.status == PENDING and company is not None else None,
         "scheduled_at": p.scheduled_at.isoformat() if p.scheduled_at else None,
         "published_at": p.published_at.isoformat() if p.published_at else None,
         "external_message_id": p.external_message_id, "external_url": p.external_url,

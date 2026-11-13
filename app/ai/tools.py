@@ -6,13 +6,18 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Company, Document, Source
@@ -20,7 +25,12 @@ from app.rag.index import HybridSearcher
 from app.services import analytics, posts as posts_svc
 from app.services import memory as mem
 
-from .connectors.base import AIConnector, AIMessage, AIResult
+from .connectors.base import AIConnector, AIMessage, AIResult, AITemporarilyUnavailable
+
+log = logging.getLogger(__name__)
+_CITATION_NUMBER = re.compile(r"\[(\d+)\](?!\s*https?://)")
+_CITATION_WITH_URL = re.compile(r"\[(\d+)\]([ \t]+)(https?://[^\s)>\]]+)")
+_SOURCE_URL = re.compile(r"(?:https?://|file://)[^\s)>\]]+")
 
 
 class ToolError(RuntimeError):
@@ -42,8 +52,21 @@ class Budget:
     def check(self) -> None:
         if self.llm_calls >= self.max_llm_calls:
             raise BudgetExceeded(f"Исчерпан лимит вызовов модели на запрос ({self.max_llm_calls})")
-        if time.monotonic() - self.started > self.max_seconds:
-            raise BudgetExceeded(f"Превышено время выполнения ({int(self.max_seconds)} с)")
+
+    @asynccontextmanager
+    async def deadline(self):
+        remaining = self.max_seconds - (time.monotonic() - self.started)
+        message = f"Превышено время выполнения ({self.max_seconds:g} с)"
+        if remaining <= 0:
+            raise BudgetExceeded(message)
+        timeout = asyncio.timeout(remaining)
+        try:
+            async with timeout:
+                yield
+        except TimeoutError as e:
+            if timeout.expired():
+                raise BudgetExceeded(message) from e
+            raise
 
     @property
     def remaining_calls(self) -> int:
@@ -63,6 +86,30 @@ class ToolContext:
     notifier: Any = None
     # действия после фиксации транзакции (уведомления), вызываются оркестратором: fn(session) -> awaitable
     after_commit: list[Callable[[AsyncSession], Awaitable[Any]]] = field(default_factory=list)
+    sources: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def cite(self, url: str, title: str, source_type: str) -> int:
+        citation = self.sources.get(url)
+        if citation is None:
+            citation = {"n": len(self.sources) + 1, "title": title, "url": url, "source_type": source_type}
+            self.sources[url] = citation
+        return citation["n"]
+
+    def answer_sources(self, answer: str) -> tuple[str, list[dict[str, Any]]]:
+        paired: set[int] = set()
+
+        def normalize(match: re.Match[str]) -> str:
+            citation = self.sources.get(match[3].rstrip(".,;:!?"))
+            if citation is None:
+                return match[0]
+            paired.add(citation["n"])
+            return f"[{citation['n']}]{match[2]}{match[3]}"
+
+        answer = _CITATION_WITH_URL.sub(normalize, answer)
+        standalone = _CITATION_WITH_URL.sub("", answer)
+        numbers = paired | {int(n) for n in _CITATION_NUMBER.findall(standalone) if len(n) <= 6}
+        urls = {url.rstrip(".,;:!?") for url in _SOURCE_URL.findall(answer)}
+        return answer, [c for c in self.sources.values() if c["n"] in numbers or c["url"] in urls]
 
     async def company(self) -> Company:
         c = await self.session.get(Company, self.company_id)
@@ -75,11 +122,20 @@ class ToolContext:
         from app.services import usage
 
         self.budget.check()
-        await usage.check_quota(self.session, self.company_id)
-        self.budget.llm_calls += 1
-        res = await self.connector.complete(messages, instructions=instructions)
+        async with self.budget.deadline():
+            try:
+                attempt = await usage.reserve_call(self.session, self.company_id, self.connector.name or "unknown")
+            except SQLAlchemyError as e:
+                raise AITemporarilyUnavailable("Не удалось учесть вызов модели. Повторите запрос позже.",
+                                               reason="usage_reservation_unavailable") from e
+            self.budget.llm_calls += 1
+            res = await self.connector.complete(messages, instructions=instructions)
         self.last_result = res
-        await usage.record(self.session, self.company_id, res)
+        try:
+            async with self.budget.deadline():
+                await usage.record_tokens(self.session, attempt, res)
+        except (BudgetExceeded, SQLAlchemyError, ValueError, TypeError):
+            log.warning("Не удалось записать число токенов вызова %s", attempt, exc_info=True)
         return res
 
     async def llm(self, prompt: str, instructions: str) -> AIResult:
@@ -140,14 +196,16 @@ async def call_tool(ctx: ToolContext, name: str, args: dict[str, Any] | None) ->
     if t is None:
         raise ToolError(f"Неизвестный инструмент: {name}")
     args = {k: v for k, v in (args or {}).items() if k in t.params}  # лишние аргументы (в т.ч. company_id) отбрасываются
-    return await t.fn(ctx, **args)
+    async with ctx.budget.deadline():
+        return await t.fn(ctx, **args)
 
 
 # --------------------------------------------------------------------------- знания
 
-def _hits(hits) -> list[dict[str, Any]]:
-    return [{"n": i, "title": h.title, "url": h.url, "source_type": h.source_type, "is_competitor": h.is_competitor,
-             "published_at": h.published_at, "text": h.text[:900]} for i, h in enumerate(hits, 1)]
+def _hits(ctx: ToolContext, hits) -> list[dict[str, Any]]:
+    return [{"n": ctx.cite(h.url, h.title, h.source_type), "title": h.title, "url": h.url,
+             "source_type": h.source_type, "is_competitor": h.is_competitor,
+             "published_at": h.published_at, "text": h.text[:900]} for h in hits]
 
 
 @tool("search_company_knowledge", "поиск по базе знаний компании (сайт, посты, файлы); возвращает фрагменты со ссылками",
@@ -155,7 +213,7 @@ def _hits(hits) -> list[dict[str, Any]]:
 async def search_company_knowledge(ctx: ToolContext, query: str = "") -> Any:
     if not query.strip():
         raise ToolError("Пустой запрос")
-    return _hits(await ctx.searcher.search(ctx.session, ctx.company_id, query, limit=6, competitor=False))
+    return _hits(ctx, await ctx.searcher.search(ctx.session, ctx.company_id, query, limit=6, competitor=False))
 
 
 @tool("search_competitors", "поиск только по данным конкурентов компании", {"query": "строка запроса"})
@@ -163,7 +221,7 @@ async def search_competitors(ctx: ToolContext, query: str = "") -> Any:
     if not query.strip():
         raise ToolError("Пустой запрос")
     hits = await ctx.searcher.search(ctx.session, ctx.company_id, query, limit=6, competitor=True)
-    return _hits(hits) or {"note": "Данных конкурентов нет: добавьте источник с флагом конкурента"}
+    return _hits(ctx, hits) or {"note": "Данных конкурентов нет: добавьте источник с флагом конкурента"}
 
 
 @tool("get_company_profile", "профиль компании и подключённые источники")
@@ -202,7 +260,8 @@ async def get_recent_posts(ctx: ToolContext, limit: int | str = 10) -> Any:
         Document.is_competitor.is_(False)).order_by(Document.published_at.desc().nulls_last()).limit(n))).all()
     return {"system_posts": [{k: v for k, v in posts_svc.post_to_dict(p).items()
                               if k in ("id", "status", "topic", "text", "scheduled_at", "published_at")} for p in own],
-            "channel_posts": [{"title": d.title[:120], "text": d.text[:500], "url": d.url,
+            "channel_posts": [{"n": ctx.cite(d.url, d.title, d.source_type),
+                               "title": d.title[:120], "text": d.text[:500], "url": d.url,
                                "published_at": d.published_at.isoformat() if d.published_at else None,
                                "metrics": {k: v for k, v in (d.metrics or {}).items() if k != "reactions"}}
                               for d in channel]}
@@ -229,8 +288,8 @@ async def _company_brief(ctx: ToolContext, query: str) -> str:
         parts.append("Память (стиль, цели, решения):\n" + "\n".join(f"- [{m['category']}] {m['content']}"
                                                                      for m in memory["long_term"]))
     if hits:
-        parts.append("Фрагменты базы знаний:\n" + "\n".join(f"[{i}] {h.title} ({h.url}): {h.text[:700]}"
-                                                           for i, h in enumerate(hits, 1)))
+        parts.append("Фрагменты базы знаний:\n" + "\n".join(
+            f"[{ctx.cite(h.url, h.title, h.source_type)}] {h.title} ({h.url}): {h.text[:700]}" for h in hits))
     return "\n\n".join(parts)
 
 
