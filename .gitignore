@@ -12,3 +12,7 @@ data/*/media/
 data/hf-cache/
 .DS_Store
 .ruff_cache/
+
+# Local company data and documents
+/data/*
+/doc-1794511527.pdf

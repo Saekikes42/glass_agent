@@ -184,6 +184,34 @@ async def test_file_upload_search_and_post_flow(client):
     assert stats["posts_by_status"] == {"draft": 1} and stats["knowledge_documents"] == {"file": 1}
 
 
+async def test_publish_now_sends_and_returns_published_without_scheduler(client):
+    calls = []
+
+    class FakePublisher:
+        async def publish(self, post, target):
+            calls.append((str(post.id), target))
+            return {"message_id": "123", "url": "https://t.me/test_channel/123"}
+
+    client.app.state.publisher = FakePublisher()
+    cid = await new_company(client, settings={"channels": {"telegram": "@test_channel"}})
+    root = f"/api/companies/{cid}/posts"
+    response = await client.post(root, json={"text": "Текст для публикации"}, headers=tma(EDITOR))
+    assert response.status_code == 201, response.text
+    pid = response.json()["id"]
+    path = f"{root}/{pid}"
+    assert (await client.post(path + "/submit", json={}, headers=tma(EDITOR))).status_code == 200
+    assert (await client.post(path + "/approve", json={}, headers=tma(OWNER))).status_code == 200
+    planned = await client.post(path + "/schedule", json={"at": "2030-01-01T10:00:00Z"}, headers=tma(OWNER))
+    assert planned.json()["status"] == "scheduled"
+    assert not calls
+    immediate = await client.post(path + "/schedule", json={"at": None}, headers=tma(OWNER))
+    assert immediate.status_code == 200, immediate.text
+    assert immediate.json()["status"] == "published"
+    assert immediate.json()["external_url"] == "https://t.me/test_channel/123"
+    assert (await client.post(path + "/schedule", json={"at": None}, headers=tma(OWNER))).status_code == 409
+    assert calls == [(pid, "@test_channel")]
+
+
 async def test_approve_api_rejects_stale_review_token(client):
     cid = await new_company(client, settings={"channels": {"telegram": "@test_channel"}})
     response = await client.post(f"/api/companies/{cid}/posts", json={"text": "Первая версия"},

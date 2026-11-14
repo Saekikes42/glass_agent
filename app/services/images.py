@@ -13,10 +13,11 @@ from __future__ import annotations
 import os
 import textwrap
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, UnidentifiedImageError
 
 TEMPLATES = {"square": (1080, 1080), "portrait": (1080, 1350), "story": (1080, 1920), "wide": (1280, 720)}
 DEFAULT_COLORS = ["#0B3D5C", "#1F7A8C", "#FFFFFF"]  # фон-1, фон-2, текст
@@ -158,6 +159,20 @@ def render_for_company(data_dir: Path, slug: str, settings: dict[str, Any], out_
     out = Path(data_dir) / slug / "images" / f"{out_name}.png"
     return render_template(out, title=title, subtitle=subtitle, footer=settings.get("site", ""), template=template,
                            colors=settings.get("brand_colors"), background=bg, logo=logo)
+
+
+def save_uploaded_post_image(data: bytes, out: Path) -> None:
+    """Проверить изображение и сохранить в формате, который использует публикация."""
+    try:
+        with Image.open(BytesIO(data), formats=("PNG", "JPEG", "WEBP")) as source:
+            if source.width * source.height > 20_000_000 or getattr(source, "is_animated", False):
+                raise ImageError("Нужно статичное изображение до 20 мегапикселей")
+            image = ImageOps.exif_transpose(source).convert("RGBA")
+            image.info.clear()
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as e:
+        raise ImageError("Выберите исправный файл PNG, JPEG или WebP") from e
+    out.parent.mkdir(parents=True, exist_ok=True)
+    image.save(out, "PNG")
 
 
 # --------------------------------------------------------------------------- локальная генеративная модель

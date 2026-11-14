@@ -75,6 +75,7 @@ class Settings(BaseSettings):
 
     # Изображения: локальная генеративная модель (diffusers), пусто = только шаблоны Pillow
     local_image_model: str | None = None
+    codex_image_executable: Path | None = None
 
     # Публикация и планировщик
     scheduler_interval: int = 30
@@ -87,6 +88,7 @@ class Settings(BaseSettings):
     upload_max_mb: int = 20
     cors_origins: str = ""  # через запятую: адрес Mini App, например https://app.example.com
     mini_app_url: str | None = None  # кнопка «Открыть приложение» в боте
+    mini_app_static_dir: Path | None = None
 
     @property
     def cors_origin_list(self) -> list[str]:

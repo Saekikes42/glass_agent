@@ -13,6 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import get_settings
@@ -26,6 +27,8 @@ def create_app(*, sessionmaker=None, connector=None, embedder=None, searcher=Non
                publisher=None, bot_token: str | None = None, init_database: bool = True,
                cors_origins: list[str] | None = None) -> FastAPI:
     s = get_settings()
+    if s.mini_app_static_dir is not None and s.api_dev_user_id is not None:
+        raise RuntimeError("Перед запуском публичного Mini App отключите API_DEV_USER_ID.")
 
     def _wire(st: Any) -> None:
         """Достраивает зависимости, которые не переданы явно (orchestrator, notifier, publisher, task_deps)."""
@@ -117,6 +120,9 @@ def create_app(*, sessionmaker=None, connector=None, embedder=None, searcher=Non
     @app.get("/health", tags=["system"])
     async def health():
         return {"ok": True}
+
+    if s.mini_app_static_dir is not None:
+        app.mount("/", StaticFiles(directory=s.mini_app_static_dir, html=True), name="mini_app")
 
     return app
 

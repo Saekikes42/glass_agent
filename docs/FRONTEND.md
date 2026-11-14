@@ -1,6 +1,6 @@
 # Фронтенд: Telegram Mini App (Vue 3) — контракт с backend
 
-Фронтенд Vue 3 предстоит реализовать. Полная схема доступна в [`docs/openapi.json`](openapi.json)
+Фронтенд Vue 3 находится в [frontend](../frontend/README.md). Полная схема доступна в [`docs/openapi.json`](openapi.json)
 и по адресу `http://127.0.0.1:8000/docs` после запуска API. Обновление схемы:
 `python -m scripts.manage export-openapi docs/openapi.json`.
 Типы для TypeScript: `npx openapi-typescript docs/openapi.json -o src/api/schema.d.ts`.

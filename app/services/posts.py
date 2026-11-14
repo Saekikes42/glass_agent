@@ -286,7 +286,8 @@ async def schedule(session: AsyncSession, post: Post, at: datetime | None, *, us
     at = at or _now()
     if at.tzinfo is None:
         at = at.replace(tzinfo=timezone.utc)
-    _move(post, SCHEDULED)
+    if post.status != SCHEDULED:
+        _move(post, SCHEDULED)
     post.scheduled_at = at
     _audit(session, post, "schedule", user_id, at=at.isoformat())
     await mem.remember(session, post.company_id, f"Пост {post.id} запланирован на {at.isoformat()}",
