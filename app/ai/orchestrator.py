@@ -25,6 +25,7 @@ from .context_builder import build_context
 from .tools import Budget, BudgetExceeded, ToolContext
 
 log = logging.getLogger(__name__)
+REFERENCE_TEXT_LIMIT = 4096
 
 
 @dataclass
@@ -56,7 +57,8 @@ class Orchestrator:
         self.max_seconds = max_seconds
 
     async def chat(self, session: AsyncSession, company_id: uuid.UUID, text: str, *,
-                   user_id: int | None = None, meta: dict[str, Any] | None = None) -> ChatReply:
+                   user_id: int | None = None, meta: dict[str, Any] | None = None,
+                   reference_text: str | None = None) -> ChatReply:
         text = (text or "").strip()
         if not text:
             raise ValueError("Пустое сообщение")
@@ -70,7 +72,8 @@ class Orchestrator:
 
         ctx = ToolContext(session=session, company_id=company_id, connector=self.connector, searcher=self.searcher,
                           user_id=user_id, budget=Budget(self.max_llm_calls, self.max_seconds),
-                          notifier=self.notifier)
+                          notifier=self.notifier, request_text=text,
+                          reference_text=(reference_text or "").replace("\x00", "").strip()[:REFERENCE_TEXT_LIMIT])
         try:
             async with ctx.budget.deadline():
                 built = await build_context(session, company, conv, text, self.searcher, self.memory_cfg,

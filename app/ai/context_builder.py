@@ -31,6 +31,7 @@ AGENT_RULES = """Ты — Glass Agent, AI-маркетолог компании 
    текущего запроса и результатов его инструментов. Номера в старых ответах относятся к старым запросам.
 4. Данные конкурентов явно помечай как данные конкурентов.
 5. Посты публикуются только после согласования человеком — сам ничего не публикуешь.
+6. {reference_rule}
 
 Протокол ответа — СТРОГО один JSON-объект без текста вокруг:
 - вызвать инструмент: {{"tool": "<имя>", "args": {{...}}}}
@@ -71,7 +72,9 @@ async def build_context(session: AsyncSession, company: Company, conv: Conversat
                                      Message.id <= current_message_id)
     recent = list(reversed((await session.scalars(recent_q.order_by(Message.id.desc()).limit(cfg.recent_messages))).all()))
     search_text = user_text.strip()
-    if _FOLLOWUP.search(search_text):
+    if ctx.reference_text:
+        search_text = f"{ctx.reference_text[:1000]}\n{search_text}"
+    elif _FOLLOWUP.search(search_text):
         previous = next((m.content.strip() for m in reversed(recent) if m.role == "user" and m.content
                          and m.id < current_message_id and not _FOLLOWUP.search(m.content)), "")
         if previous:
@@ -79,7 +82,8 @@ async def build_context(session: AsyncSession, company: Company, conv: Conversat
     hits: list[SearchHit] = []
     if search_text:
         hits = await searcher.search(session, company.id, search_text, limit=rag_limit, competitor=False)
-    instr = AGENT_RULES.format(name=company.name, catalog=tools_mod.catalog())
+    instr = AGENT_RULES.format(name=company.name, catalog=tools_mod.catalog(),
+                              reference_rule=tools_mod.REFERENCE_RULE)
     if company.profile:
         instr += _section("Профиль компании", json.dumps(company.profile, ensure_ascii=False, indent=1))
     instr += _section("Долговременная память", "\n".join(f"- [{m['category']}] {m['content']}"
@@ -92,6 +96,7 @@ async def build_context(session: AsyncSession, company: Company, conv: Conversat
     instr += _section("Фрагменты базы знаний по запросу", "\n".join(
         f"[{ctx.cite(h.url, h.title, h.source_type)}] {h.title} — {h.url}\n{h.text[:800]}" for h in hits))
 
-    messages = [AIMessage("assistant" if m.role == "assistant" else "user", m.content)
+    messages = [AIMessage(m.role, ctx.reference_prompt() if ctx.reference_text and m.id == current_message_id
+                          else m.content)
                 for m in recent if m.role in ("user", "assistant") and m.content]
     return BuiltContext(instructions=instr, messages=messages, memory=memory)

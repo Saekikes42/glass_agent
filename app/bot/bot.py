@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -27,13 +28,36 @@ from app.services.publisher import PublishError, TelegramBotAPI, send_approval_p
 
 log = logging.getLogger(__name__)
 ROLE_RANK = {"viewer": 0, "editor": 1, "approver": 2, "owner": 3}
+POST_ABOVE = re.compile(
+    r"\b(?:пост\w*|сообщени\w*|публикаци\w*|материал\w*|видео)\s+(?:выше|сверху)\b"
+    r"|\b(?:пересланн\w*|прикрепл[её]нн\w*|по\s+эт(?:ому|ой))\s+"
+    r"(?:пост\w*|сообщени\w*|публикаци\w*|материал\w*|видео)\b",
+    re.IGNORECASE,
+)
+MEDIA_WITHOUT_TEXT = ("В исходном сообщении нет текста или подписи. Пришлите текст или кратко опишите, "
+                      "что взять из фото или видео.")
+REVIEW_ACTIONS = {"ap", "pn", "rv", "rj"}
+REVIEW_STATUS_MESSAGES = {
+    P.APPROVED: "Пост уже согласован.",
+    P.SCHEDULED: "Пост уже в очереди на публикацию.",
+    P.PUBLISHING: "Пост уже отправляется в канал.",
+    P.PUBLISHED: "Пост уже опубликован.",
+    P.REVISION: "Пост уже возвращён на доработку.",
+    P.REJECTED: "Пост уже отклонён.",
+    P.FAILED: "Пост согласован, но отправка завершилась ошибкой.",
+}
 HELP = ("Glass Agent — AI-маркетолог.\n\n"
         "Пишите задачу обычным текстом: «подготовь пост про …», «что у нас с охватами?», «составь план на неделю».\n\n"
-        "/companies — мои компании · /use <slug> — выбрать\n/posts — на согласовании · /report — отчёт\n"
+        "Чтобы сделать пост по готовому материалу, ответьте на исходное сообщение или перешлите его и напишите задачу.\n\n"
+        "/companies — мои компании · /use <slug> — выбрать\n/posts — сохранённые черновики и посты на согласовании · /report — отчёт\n"
         "/tasks — регулярные задачи · /inbox — комментарии · /ai — статус ChatGPT")
 ADMIN_HELP = ("\n\nАдминистратор:\n/newcompany Название\n/addsource website|telegram_web|vk <ссылка> [конкурент]\n"
               "/setchannel telegram|vk|max|telegram_discussion <id>\n/invite <telegram_id> owner|approver|editor|viewer\n"
               "/sync — обновить источники")
+
+
+def _message_text(message: dict[str, Any]) -> str:
+    return (message.get("text") or message.get("caption") or "").strip()
 
 
 class GlassBot:
@@ -107,20 +131,26 @@ class GlassBot:
         if "callback_query" in update:
             return await self.on_callback(update["callback_query"])
         msg = update.get("message")
-        if not msg or "text" not in msg:
+        if not msg:
             return
         if msg.get("chat", {}).get("type") in ("group", "supergroup"):
+            if "text" not in msg:
+                return
             async with self.sm() as session:
                 if await inbox_svc.record_telegram_message(session, msg):  # комментарий в группе обсуждения
                     await session.commit()
             return
-        if msg.get("chat", {}).get("type") != "private":
+        if msg.get("chat", {}).get("type") != "private" or not msg.get("from"):
             return
-        chat_id, text, tg = msg["chat"]["id"], msg["text"].strip(), msg["from"]
+        chat_id, text, tg = msg["chat"]["id"], _message_text(msg), msg["from"]
+        forwarded = "forward_origin" in msg or "forward_date" in msg
+        media_only = not text and any(kind in msg for kind in ("photo", "video", "animation", "video_note"))
+        if not text and not forwarded and not media_only:
+            return
         async with self.sm() as session:
             user = await self._user(session, tg)
             cmd, _, arg = text.partition(" ")
-            cmd = cmd.split("@")[0].lower() if cmd.startswith("/") else ""
+            cmd = cmd.split("@")[0].lower() if not forwarded and cmd.startswith("/") else ""
             arg = arg.strip()
             if cmd in ("/start", "/help"):
                 return await self._help(chat_id, user, tg)
@@ -132,7 +162,7 @@ class GlassBot:
                 rows = {c.slug: c for c, _ in await self._companies(session, user)}
                 if arg not in rows:
                     return await self.send(chat_id, "Компания не найдена. /companies — список.")
-                self._set_pref(user, company_id=str(rows[arg].id), awaiting=None)
+                self._set_pref(user, company_id=str(rows[arg].id), awaiting=None, telegram_reference=None)
                 await session.commit()
                 return await self.send(chat_id, f"Выбрана компания «{rows[arg].name}». Пишите задачу.")
             if cmd == "/ai":
@@ -144,13 +174,10 @@ class GlassBot:
                 return await self.send(chat_id, "Сначала выберите компанию: /use <slug> (/companies — список)")
             role = await self._role(session, user, company.id)
             if role is None:
-                self._set_pref(user, company_id=None)
+                self._set_pref(user, company_id=None, telegram_reference=None)
                 await session.commit()
                 return await self.send(chat_id, "Нет доступа к компании.")
             rank = ROLE_RANK.get(role, 0)
-            awaiting = (user.prefs or {}).get("awaiting")
-            if awaiting and not cmd:
-                return await self._awaited_input(session, chat_id, user, company, awaiting, text)
             if cmd == "/posts":
                 return await self.show_pending(session, chat_id, company.id)
             if cmd == "/report":
@@ -168,7 +195,46 @@ class GlassBot:
                 return await self.send(chat_id, "Неизвестная команда. /help")
             if rank < ROLE_RANK["editor"]:
                 return await self.send(chat_id, "Для поручений AI нужна роль editor.")
-            await self._chat(session, chat_id, user, company, text)
+            if forwarded or media_only:
+                reference = {"company_id": str(company.id), "text": text[:4096]} if text else None
+                if reference is not None or (user.prefs or {}).get("telegram_reference") is not None:
+                    self._set_pref(user, telegram_reference=reference)
+                    await session.commit()
+                return await self.send(chat_id, ("Получил пересланный пост. Следующим сообщением напишите, "
+                                                 "что с ним сделать, например: «Подготовь черновик по этому посту».")
+                                       if text else MEDIA_WITHOUT_TEXT)
+
+            prefs = user.prefs or {}
+            pending = prefs.get("telegram_reference")
+            if pending and pending.get("company_id") != str(company.id):
+                pending = None
+            reply = msg.get("reply_to_message") or {}
+            quote = msg.get("quote") or {}
+            explicit_reply = bool(reply or quote or msg.get("external_reply"))
+            refers_above = bool(POST_ABOVE.search(text))
+            awaiting = prefs.get("awaiting")
+            if awaiting and not pending and not refers_above and (
+                not explicit_reply or (reply.get("from") or {}).get("is_bot")
+            ):
+                return await self._awaited_input(session, chat_id, user, company, awaiting, text)
+
+            reference = None
+            if explicit_reply:
+                reference = _message_text(quote) or _message_text(reply)
+                if not reference:
+                    if pending:
+                        self._set_pref(user, telegram_reference=None)
+                        await session.commit()
+                    return await self.send(chat_id, MEDIA_WITHOUT_TEXT)
+            elif pending:
+                reference = pending["text"]
+            if refers_above and not reference:
+                return await self.send(chat_id, "Не вижу, какой пост вы имеете в виду. Нажмите «Ответить» на нужном "
+                                       "сообщении или перешлите его, затем напишите задачу.")
+            if reference:
+                self._set_pref(user, telegram_reference=None, awaiting=None)
+                await session.commit()
+            await self._chat(session, chat_id, user, company, text, reference_text=reference)
 
     async def _help(self, chat_id: int, user: User, tg: dict[str, Any]) -> None:
         s = get_settings()
@@ -193,18 +259,27 @@ class GlassBot:
                     "Администратор: python -m scripts.chatgpt_login")
         await self.send(chat_id, text)
 
-    async def _chat(self, session: AsyncSession, chat_id: int, user: User, company: Company, text: str) -> None:
+    async def _chat(self, session: AsyncSession, chat_id: int, user: User, company: Company, text: str,
+                    *, reference_text: str | None = None) -> None:
         if self.orchestrator is None:
             return await self.send(chat_id, "AI не настроен.")
         await self.api.call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
         try:
-            r = await self.orchestrator.chat(session, company.id, text, user_id=user.id)
+            kwargs = {"reference_text": reference_text[:4096]} if reference_text else {}
+            r = await self.orchestrator.chat(session, company.id, text, user_id=user.id, **kwargs)
         except AIError as e:
             return await self.send(chat_id, f"{e.code}: {e}")
         answer = r.answer
         if r.is_mock and not answer.startswith("[ТЕСТОВАЯ МОДЕЛЬ]"):
             answer = "[ТЕСТОВАЯ МОДЕЛЬ] " + answer
         await self.send(chat_id, answer)
+        for post_id in dict.fromkeys(r.created_post_ids):
+            try:
+                post = await P.get_post(session, company.id, post_id)
+            except LookupError:
+                continue
+            if post.status == P.DRAFT:
+                await self._draft_card(chat_id, post, new=True)
 
     async def _new_company(self, session: AsyncSession, chat_id: int, user: User, name: str) -> None:
         from app.services.sources import create_company, slugify
@@ -218,7 +293,7 @@ class GlassBot:
             slug = f"{slug[:50]}-{uuid.uuid4().hex[:4]}"
         c = await create_company(session, name, slug=slug, user_id=user.id)
         session.add(CompanyMember(company_id=c.id, user_id=user.id, role="owner"))
-        self._set_pref(user, company_id=str(c.id))
+        self._set_pref(user, company_id=str(c.id), awaiting=None, telegram_reference=None)
         await session.commit()
         await self.send(chat_id, f"Компания «{name}» подключена (slug {slug}) и выбрана.\nДальше:\n"
                                  "/addsource website https://сайт\n/addsource telegram_web https://t.me/канал\n"
@@ -341,14 +416,19 @@ class GlassBot:
         if not posts and not drafts:
             return await self.send(chat_id, "Нет постов на согласовании и черновиков.")
         company = await session.get(Company, company_id)
+        await self.send(chat_id, f"«{company.name}»: сохранённые черновики и посты на согласовании.")
         for p in posts:
             try:
                 await send_approval_preview(self.api, chat_id, p, company)
             except PublishError as e:
                 await self.send(chat_id, f"Не удалось показать материал на согласование: {e}")
         for p in drafts:
-            await self.send(chat_id, f"Черновик · {p.platform} · {p.id}\n\n{p.text[:3500]}", reply_markup={
-                "inline_keyboard": [[{"text": "📨 На согласование", "callback_data": f"sb:{p.id}"}]]})
+            await self._draft_card(chat_id, p)
+
+    async def _draft_card(self, chat_id: int, post: P.Post, *, new: bool = False) -> None:
+        label = "Новый черновик" if new else "Черновик"
+        await self.send(chat_id, f"{label} · {post.platform} · {post.id}\n\n{post.text[:3500]}", reply_markup={
+            "inline_keyboard": [[{"text": "📨 На согласование", "callback_data": f"sb:{post.id}"}]]})
 
     async def on_callback(self, cq: dict[str, Any]) -> None:
         data, tg = cq.get("data", ""), cq["from"]
@@ -373,25 +453,37 @@ class GlassBot:
                     note = "Пост не найден"
                 elif ROLE_RANK.get(await self._role(session, user, post.company_id) or "", -1) < need:
                     note = "Недостаточно прав"
+                elif action in REVIEW_ACTIONS and post.status in REVIEW_STATUS_MESSAGES:
+                    note = REVIEW_STATUS_MESSAGES[post.status]
+                    if post.status == P.SCHEDULED and not (post.meta or {}).get("approval_target"):
+                        note += " Канал не был указан при согласовании."
                 else:
                     try:
                         company = await session.get(Company, post.company_id)
-                        if action in ("ap", "pn", "rv", "rj"):
+                        if action in REVIEW_ACTIONS:
                             P.require_current_review(post, company, review_token)
-                        if action == "ap":
-                            await P.approve(session, post, user_id=user.id, scheduled_at=post.proposed_at)
-                            note = ("Согласовано, публикация " + post.proposed_at.astimezone().strftime("%d.%m %H:%M")
-                                    if post.proposed_at else "Согласовано. Время публикации — в приложении или «Опубликовать»")
-                        elif action == "pn":
-                            await P.approve(session, post, user_id=user.id, scheduled_at=datetime.now(timezone.utc))
-                            note = "Согласовано, публикация в ближайшую минуту"
+                        if action in ("ap", "pn"):
+                            scheduled_at = datetime.now(timezone.utc) if action == "pn" else post.proposed_at
+                            target = P.target_for(post, company)
+                            if scheduled_at is not None and not target:
+                                raise P.PostStateError("Канал публикации не настроен. Настройте его командой "
+                                                       f"/setchannel {post.platform} и обновите карточку через /posts.")
+                            await P.approve(session, post, user_id=user.id, scheduled_at=scheduled_at)
+                            if action == "pn":
+                                note = "Согласовано. Пост в очереди на публикацию."
+                            elif scheduled_at is not None:
+                                note = "Согласовано, публикация " + scheduled_at.astimezone().strftime("%d.%m %H:%M")
+                            elif not target:
+                                note = "Согласовано. Для публикации укажите канал и согласуйте материал повторно."
+                            else:
+                                note = "Согласовано. Публикацию можно запланировать в приложении."
                         elif action == "rj":
                             await P.reject(session, post, user_id=user.id, comment="Отклонено в боте")
                             note = "Отклонено — публикации не будет"
                         elif action == "rv":
                             self._set_pref(user, awaiting={"kind": "revision", "post_id": str(post.id),
                                                           "review_token": review_token},
-                                           company_id=str(post.company_id))
+                                           company_id=str(post.company_id), telegram_reference=None)
                             note = "Напишите комментарий — что доработать"
                             followup = "✏️ Напишите одним сообщением, что доработать в посте:"
                         elif action == "sb":

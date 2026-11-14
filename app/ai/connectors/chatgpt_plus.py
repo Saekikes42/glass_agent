@@ -161,7 +161,6 @@ class ChatGPTPlusConnector:
                 reason="paused")
         creds = await self.tokens.get_credentials()
         body: dict[str, Any] = {
-            "model": await self._resolve_model(model),
             "input": build_input(messages),
             "store": False,
             "stream": True,
@@ -170,30 +169,46 @@ class ChatGPTPlusConnector:
             body["instructions"] = instructions
         refreshed = False
         for attempt in range(self.max_retries + 1):
-            async with self._client() as client:
-                async with client.stream("POST", f"{self.api_base}/responses", json=body, headers={
-                    "Authorization": f"Bearer {creds.access_token}",
-                    "Content-Type": "application/json", "Accept": "text/event-stream",
-                }) as r:
-                    if r.status_code == 401 and not refreshed:
-                        refreshed = True  # одно принудительное обновление токена и повтор
-                        creds = await self.tokens.get_credentials(
-                            force_refresh=True, rejected_access_token=creds.access_token)
-                        continue
-                    if r.status_code != 200:
-                        await r.aread()
-                        err = _error_from(r.status_code, _json(r))
-                        self._maybe_pause(err)
-                        # 503 *_unavailable: ограниченный повтор с паузой (errors-and-recovery), учётные данные не трогаем
-                        if _retryable(err) and attempt < self.max_retries:
-                            delay = self.retry_base_s * 3 ** attempt
-                            log.warning("ChatGPT временно недоступен (%s), повтор через %.0f с", err.reason, delay)
-                            await asyncio.sleep(delay)
+            response_open = False
+            try:
+                if "model" not in body:
+                    body["model"] = await self._resolve_model(model)
+                async with self._client() as client:
+                    async with client.stream("POST", f"{self.api_base}/responses", json=body, headers={
+                        "Authorization": f"Bearer {creds.access_token}",
+                        "Content-Type": "application/json", "Accept": "text/event-stream",
+                    }) as r:
+                        response_open = True
+                        if r.status_code == 401 and not refreshed:
+                            refreshed = True  # одно принудительное обновление токена и повтор
+                            creds = await self.tokens.get_credentials(
+                                force_refresh=True, rejected_access_token=creds.access_token)
                             continue
-                        raise err
-                    async for event, data in _iter_sse(r):
-                        yield event, data
-                    return
+                        if r.status_code != 200:
+                            await r.aread()
+                            err = _error_from(r.status_code, _json(r))
+                            self._maybe_pause(err)
+                            # Для временной ошибки API допускается ограниченный повтор.
+                            if not _retryable(err) or attempt >= self.max_retries:
+                                raise err
+                            retry_reason = err.reason
+                        else:
+                            async for event, data in _iter_sse(r):
+                                yield event, data
+                                if event == "response.completed":
+                                    return
+                            return
+            except httpx.TransportError as e:
+                # Повторяем только сбой до отправки запроса. Прерванный поток не проигрываем заново.
+                retry_reason = type(e).__name__
+                safe_to_retry = isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+                if response_open or not safe_to_retry or attempt >= self.max_retries:
+                    raise AITemporarilyUnavailable(
+                        "Связь с ChatGPT прервалась. Повторите запрос чуть позже.", reason="network_error"
+                    ) from e
+            delay = self.retry_base_s * 3 ** attempt
+            log.warning("ChatGPT временно недоступен (%s), повтор через %.0f с", retry_reason, delay)
+            await asyncio.sleep(delay)
         raise AITemporarilyUnavailable("ChatGPT недоступен после повторов", reason="retries_exhausted")
 
     def _maybe_pause(self, err: Exception) -> None:

@@ -7,7 +7,9 @@ from cryptography.fernet import Fernet
 
 from app.ai.auth.token_refresh import TokenManager
 from app.ai.auth.token_storage import EncryptedTokenStorage
-from app.ai.connectors.base import AIConnectionUnavailable, AIMessage, AIUsageLimitExceeded, MockConnector
+from app.ai.connectors.base import (
+    AIConnectionUnavailable, AIMessage, AITemporarilyUnavailable, AIUsageLimitExceeded, MockConnector,
+)
 from app.ai.connectors.chatgpt_plus import ChatGPTPlusConnector
 from tests.test_chatgpt_oauth import creds
 
@@ -79,6 +81,47 @@ async def test_failed_mid_stream(tmp_path):
     c = connector(tmp_path, lambda r: httpx.Response(200, text=body))
     with pytest.raises(AIUsageLimitExceeded):
         await c.complete([AIMessage("user", "x")])
+
+
+@pytest.mark.parametrize("recovers", [True, False])
+async def test_connect_error_retries_or_returns_typed_error(tmp_path, recovers):
+    attempts = 0
+
+    def handler(req):
+        nonlocal attempts
+        attempts += 1
+        if not recovers or attempts == 1:
+            raise httpx.ConnectError("connection unavailable", request=req)
+        return httpx.Response(200, text=OK_STREAM)
+
+    c = connector(tmp_path, handler)
+    c.retry_base_s = 0
+    if recovers:
+        result = await c.complete([AIMessage("user", "x")])
+        assert result.text == "Привет, мир" and attempts == 2
+    else:
+        with pytest.raises(AITemporarilyUnavailable, match="Связь с ChatGPT прервалась"):
+            await c.complete([AIMessage("user", "x")])
+        assert attempts == c.max_retries + 1
+
+
+async def test_interrupted_response_does_not_replay_post(tmp_path):
+    class InterruptedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield sse(("response.output_text.delta", {"delta": "часть ответа"})).encode()
+            raise httpx.ReadError("connection interrupted")
+
+    attempts = []
+
+    def handler(req):
+        attempts.append(req.method)
+        return httpx.Response(200, stream=InterruptedStream())
+
+    c = connector(tmp_path, handler)
+    c.retry_base_s = 0
+    with pytest.raises(AITemporarilyUnavailable):
+        await c.complete([AIMessage("user", "x")])
+    assert attempts == ["POST"]
 
 
 async def test_401_refreshes_once(tmp_path):
